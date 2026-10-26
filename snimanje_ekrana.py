@@ -998,7 +998,7 @@ def iste_stranice(prvi, drugi):
 
 def geste_pomjeri(prema_pocetku, udio=None):
     if udio is None:
-        udio = 0.60
+        udio = 0.70
         if rucni_pomak_aktivan.get():
             try:
                 udio = min(max(float(rucni_pomak.get()), 10), 100) / 100
@@ -1016,7 +1016,7 @@ def geste_pomjeri(prema_pocetku, udio=None):
     y_pocetak, y_kraj = (y_gore, y_dole) if prema_pocetku else (y_dole, y_gore)
     adb_poziv(
         ["shell", "input", "swipe", str(sredina), str(y_pocetak),
-         str(sredina), str(y_kraj), "1200"],
+         str(sredina), str(y_kraj), "800"],
         timeout=10
     )
 
