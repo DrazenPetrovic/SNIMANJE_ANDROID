@@ -1,6 +1,7 @@
 ﻿
 import tkinter as tk
 from tkinter import filedialog, messagebox
+from tkinter import ttk
 from pathlib import Path
 from datetime import datetime
 import base64
@@ -8,8 +9,19 @@ import re
 import subprocess
 import os
 import signal
+import socket
+import sys
 
-folder = Path("D:/PROGRAMI/SNIMANJE_ANDROID/SNIMCI")
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+ADB_EXE = APP_DIR / "platform-tools" / "adb.exe"
+SCRCPY_EXE = APP_DIR / "scrcpy" / "scrcpy.exe"
+ADB_SERVER_PORT = 5038
+
+folder = Path.home() / "Pictures" / "SNIMCI"
 folder.mkdir(parents=True, exist_ok=True)
 
 proces = None
@@ -26,12 +38,28 @@ arhiva_broj = 0
 arhiva_stabilna = 0
 arhiva_paket = None
 broj_snimljenih_slika = 0
+rezim = "izbor"
+kamera = None
+kamera_writer = None
+kamera_prozor = None
+kamera_slika_widget = None
+kamera_photo = None
+kamera_zadnji_frame = None
+kamera_video_putanja = None
+automatski_screenshot_aktivan = False
+automatski_screenshot_job = None
 boje_dugmadi = {
     "pokreni": ("#1769D2", "white"),
     "video": ("#D9485F", "white"),
     "screenshot": ("#E8F1FC", "#1456A0"),
     "razgovor": ("#6B4CCB", "white"),
     "zaustavi": ("#C62828", "white"),
+    "kamera_pokreni": ("#1769D2", "white"),
+    "kamera_video": ("#D9485F", "white"),
+    "kamera_screenshot": ("#E8F1FC", "#1456A0"),
+    "kamera_postavke": ("#E8F1FC", "#1456A0"),
+    "kamera_zaustavi": ("#C62828", "white"),
+    "automatski_screenshot": ("#1769D2", "white"),
 }
 
 def zabiljezi(poruka):
@@ -47,6 +75,34 @@ def evidentiraj_snimljenu_sliku():
     global broj_snimljenih_slika
     broj_snimljenih_slika += 1
     broj_slika_status.set(f"Snimljeno slika: {broj_snimljenih_slika}")
+
+def verzija_adb():
+    if not ADB_EXE.is_file():
+        return "nije pronađen"
+    try:
+        rezultat = subprocess.run(
+            [str(ADB_EXE), "version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "nije dostupna"
+    if rezultat.returncode != 0:
+        return "nije dostupna"
+    poklapanje = re.search(r"^Version\s+(.+)$", rezultat.stdout, re.MULTILINE)
+    return poklapanje.group(1).strip() if poklapanje else "nepoznata"
+
+def osvjezi_adb_status():
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", ADB_SERVER_PORT), timeout=0.4
+        ):
+            server_status = f"aktivan na portu {ADB_SERVER_PORT}"
+    except OSError:
+        server_status = f"neaktivan na portu {ADB_SERVER_PORT}"
+    adb_status.set(f"ADB {adb_verzija_localna}: server {server_status}")
+    app.after(2000, osvjezi_adb_status)
 
 def centriraj_prozor(prozor, roditelj=None):
     prozor.update_idletasks()
@@ -128,31 +184,72 @@ def stil_dugmeta(dugme, pozadina, tekst):
     )
 
 def osvjezi_dugmad():
-    dugmad["pokreni"].config(
-        state="normal" if faza == "spremno" else "disabled"
-    )
-    dugmad["video"].config(
-        state="normal" if faza == "prikaz" else "disabled"
-    )
-    dugmad["screenshot"].config(
-        state="normal" if faza == "prikaz" else "disabled"
-    )
-    dugmad["razgovor"].config(
-        state="normal" if faza in ("prikaz", "arhiva_pocetak", "arhiva_snimanje")
-        else "disabled",
-        text=(
-            "Zaustavi snimanje razgovora"
-            if faza in ("arhiva_pocetak", "arhiva_snimanje")
-            else "Snimi razgovor (screenshotovi sa preklapanjem)"
+    if rezim == "kamera":
+        kamera_aktivna = faza in ("kamera_prikaz", "kamera_snimanje")
+        dugmad["kamera_pokreni"].config(
+            state="disabled" if kamera_aktivna else "normal"
         )
+        dugmad["kamera_video"].config(
+            state="normal" if kamera_aktivna else "disabled",
+            text=(
+                "Zaustavi MP4 snimanje"
+                if faza == "kamera_snimanje"
+                else "Pokreni MP4 snimanje"
+            )
+        )
+        dugmad["kamera_screenshot"].config(
+            state="normal" if kamera_aktivna else "disabled"
+        )
+        dugmad["kamera_postavke"].config(
+            state="normal" if kamera_aktivna else "disabled"
+        )
+        dugmad["kamera_zaustavi"].config(
+            state="normal" if kamera_aktivna else "disabled"
+        )
+    else:
+        dugmad["pokreni"].config(
+            state="normal" if faza == "spremno" else "disabled"
+        )
+        dugmad["video"].config(
+            state="normal" if faza == "prikaz" else "disabled"
+        )
+        dugmad["screenshot"].config(
+            state="normal" if faza in ("prikaz", "snimanje") else "disabled"
+        )
+        dugmad["razgovor"].config(
+            state="normal" if faza in (
+                "prikaz", "arhiva_pocetak", "arhiva_snimanje"
+            ) else "disabled",
+            text=(
+                "Zaustavi snimanje razgovora"
+                if faza in ("arhiva_pocetak", "arhiva_snimanje")
+                else "Snimi razgovor (screenshotovi sa preklapanjem)"
+            )
+        )
+        dugmad["zaustavi"].config(
+            state="normal" if faza in (
+                "prikaz", "snimanje", "arhiva_pocetak", "arhiva_snimanje"
+            ) else "disabled",
+            text=(
+                "ZAUSTAVI MP4 SNIMANJE"
+                if snimanje else "ZAUSTAVI SCRCPY"
+            )
+        )
+    spreman_za_screenshot = (
+        faza in ("kamera_prikaz", "kamera_snimanje")
+        if rezim == "kamera"
+        else faza in ("prikaz", "snimanje")
     )
-    dugmad["zaustavi"].config(
-        state="normal" if faza in (
-            "prikaz", "snimanje", "arhiva_pocetak", "arhiva_snimanje"
-        ) else "disabled",
+    dugmad["automatski_screenshot"].config(
+        state=(
+            "normal"
+            if automatski_screenshot_aktivan or spreman_za_screenshot
+            else "disabled"
+        ),
         text=(
-            "ZAUSTAVI MP4 SNIMANJE"
-            if snimanje else "ZAUSTAVI SCRCPY"
+            "Zaustavi automatske screenshotove"
+            if automatski_screenshot_aktivan
+            else "Pokreni automatske screenshotove"
         )
     )
     for ime, dugme in dugmad.items():
@@ -246,17 +343,36 @@ def prati_proces(novi_proces, pokrenuto_snimanje, putanja=None):
 
 def pokreni_scrcpy(komanda, pokrenuto_snimanje=False, putanja=None):
     global proces, putanja_snimanja
+    if not SCRCPY_EXE.is_file():
+        status.set("Lokalni scrcpy.exe nije pronađen")
+        zabiljezi(f"Greška: nije pronađen izvršni fajl {SCRCPY_EXE}")
+        messagebox.showerror(
+            "Nedostaje scrcpy.exe",
+            "U folderu scrcpy trenutno nije pronađen scrcpy.exe:\n"
+            f"{SCRCPY_EXE}\n\n"
+            "Dodaj Windows izdanje scrcpy u ovaj folder. Sam izvorni kod "
+            "scrcpy nije moguće pokrenuti direktno.",
+            parent=app
+        )
+        return
+
     visina_ekrana = app.winfo_screenheight()
     visina_prozora = round(visina_ekrana * 0.85)
     komanda = [
-        *komanda,
+        str(SCRCPY_EXE),
+        *komanda[1:],
+        "--no-audio",
         "--window-x=0",
         f"--window-y={(visina_ekrana - visina_prozora) // 2}",
         f"--window-height={visina_prozora}",
     ]
+    okruzenje = os.environ.copy()
+    okruzenje["ADB_SERVER_SOCKET"] = f"tcp:localhost:{ADB_SERVER_PORT}"
     try:
         proces = subprocess.Popen(
             komanda,
+            cwd=SCRCPY_EXE.parent,
+            env=okruzenje,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
         )
     except OSError as e:
@@ -290,7 +406,7 @@ def pokreni_scrcpy(komanda, pokrenuto_snimanje=False, putanja=None):
 def proveri_telefon():
     try:
         rezultat = subprocess.run(
-            ["adb", "devices"],
+            [str(ADB_EXE), "-P", str(ADB_SERVER_PORT), "devices"],
             capture_output=True,
             text=True,
             timeout=10
@@ -300,7 +416,8 @@ def proveri_telefon():
         zabiljezi("Greška: ADB nije pronađen.")
         messagebox.showerror(
             "Greška",
-            "ADB nije pronađen. Provjeri instalaciju Android platform-tools.",
+            "Lokalni ADB nije pronađen. Provjeri da postoji fajl:\n"
+            f"{ADB_EXE}",
             parent=app
         )
         return False
@@ -383,6 +500,7 @@ def video():
 
 def zaustavi():
     global proces, snimanje, putanja_snimanja, arhiva_aktivna
+    zaustavi_automatske_screenshotove()
     bilo_snimanje = snimanje
     putanja_videa = putanja_snimanja if bilo_snimanje else None
     if arhiva_aktivna:
@@ -403,16 +521,107 @@ def zaustavi():
         status.set("scrcpy zaustavljen")
     postavi_fazu("spremno")
 
-def screenshot():
-    if faza != "prikaz":
+def zaustavi_automatske_screenshotove():
+    global automatski_screenshot_aktivan, automatski_screenshot_job
+    automatski_screenshot_aktivan = False
+    if automatski_screenshot_job is not None:
+        try:
+            app.after_cancel(automatski_screenshot_job)
+        except tk.TclError:
+            pass
+        automatski_screenshot_job = None
+    if "timer_status" in globals():
+        timer_status.set("Automatski screenshotovi su isključeni")
+    if "automatski_screenshot" in dugmad:
+        osvjezi_dugmad()
+
+def rasporedi_automatski_screenshot():
+    global automatski_screenshot_job
+    if not automatski_screenshot_aktivan:
         return
-    if not proveri_telefon():
+    try:
+        interval = int(timer_interval_var.get())
+    except ValueError:
+        status.set("Unesi valjan interval u sekundama")
+        zaustavi_automatske_screenshotove()
         return
+    automatski_screenshot_job = app.after(
+        interval * 1000, napravi_automatski_screenshot
+    )
+
+def napravi_automatski_screenshot():
+    global automatski_screenshot_job
+    automatski_screenshot_job = None
+    if not automatski_screenshot_aktivan:
+        return
+
+    if rezim == "kamera":
+        if faza not in ("kamera_prikaz", "kamera_snimanje"):
+            zaustavi_automatske_screenshotove()
+            return
+        if not kamera_screenshot(automatski=True):
+            return
+    else:
+        if faza not in ("prikaz", "snimanje"):
+            zaustavi_automatske_screenshotove()
+            return
+        if not screenshot(automatski=True):
+            return
+
+    rasporedi_automatski_screenshot()
+
+def ukljuci_automatske_screenshotove():
+    global automatski_screenshot_aktivan
+    if automatski_screenshot_aktivan:
+        zaustavi_automatske_screenshotove()
+        zabiljezi("Automatski screenshotovi su zaustavljeni.")
+        return
+
+    spreman = (
+        faza in ("kamera_prikaz", "kamera_snimanje")
+        if rezim == "kamera"
+        else faza in ("prikaz", "snimanje")
+    )
+    if not spreman:
+        messagebox.showwarning(
+            "Snimanje nije pokrenuto",
+            "Prvo pokreni pregled Androida ili USB kamere.",
+            parent=app
+        )
+        return
+    try:
+        interval = int(timer_interval_var.get())
+    except ValueError:
+        interval = 0
+    if not 1 <= interval <= 3600:
+        messagebox.showwarning(
+            "Neispravan interval",
+            "Unesi interval od 1 do 3600 sekundi.",
+            parent=app
+        )
+        return
+
+    automatski_screenshot_aktivan = True
+    timer_status.set(f"Automatski screenshot uključen — svakih {interval} s")
+    zabiljezi(
+        f"Automatski screenshotovi uključeni (svakih {interval} sekundi)."
+    )
+    osvjezi_dugmad()
+    rasporedi_automatski_screenshot()
+
+def screenshot(automatski=False):
+    if faza not in ("prikaz", "snimanje"):
+        return False
+    if not automatski and not proveri_telefon():
+        return False
     putanja = naziv("png")
     try:
         with open(putanja, "wb") as fajl:
             rezultat = subprocess.run(
-                ["adb", "exec-out", "screencap", "-p"],
+                [
+                    str(ADB_EXE), "-P", str(ADB_SERVER_PORT),
+                    "exec-out", "screencap", "-p"
+                ],
                 stdout=fajl,
                 stderr=subprocess.PIPE,
                 timeout=20
@@ -425,14 +634,20 @@ def screenshot():
         status.set(f"Sačuvano: {putanja.name}")
         evidentiraj_snimljenu_sliku()
         zabiljezi(f"Screenshot sačuvan: {putanja}")
+        return True
     except Exception as e:
         zabiljezi(f"Greška pri izradi screenshota: {e}")
-        messagebox.showerror("Greška", str(e), parent=app)
+        if automatski:
+            status.set("Automatski screenshot nije uspio; timer je zaustavljen")
+            zaustavi_automatske_screenshotove()
+        else:
+            messagebox.showerror("Greška", str(e), parent=app)
+        return False
 
 def adb_poziv(argumenti, timeout=20):
     try:
         rezultat = subprocess.run(
-            ["adb", *argumenti],
+            [str(ADB_EXE), "-P", str(ADB_SERVER_PORT), *argumenti],
             capture_output=True,
             timeout=timeout
         )
@@ -953,24 +1168,275 @@ def izaberi_folder():
         status.set(f"Folder: {folder}")
         zabiljezi(f"Promijenjen folder za snimke: {folder}")
 
+def uvezi_opencv():
+    try:
+        import cv2
+    except ImportError:
+        messagebox.showerror(
+            "Nedostaje OpenCV",
+            "Za korištenje USB kamere instaliraj zavisnosti komandom:\n"
+            "pip install -r requirements.txt",
+            parent=app
+        )
+        return None
+    return cv2
+
+def osvjezi_kamere():
+    cv2 = uvezi_opencv()
+    if cv2 is None:
+        return
+
+    dostupne = []
+    for indeks in range(10):
+        uredjaj = cv2.VideoCapture(indeks, cv2.CAP_DSHOW)
+        try:
+            if uredjaj.isOpened():
+                dostupne.append(str(indeks))
+        finally:
+            uredjaj.release()
+
+    kamera_izbor["values"] = dostupne
+    if dostupne:
+        if kamera_izbor_var.get() not in dostupne:
+            kamera_izbor_var.set(dostupne[0])
+        status.set(f"Pronađene kamere: {', '.join(dostupne)}")
+        zabiljezi(f"Pronađene USB kamere na indeksima: {', '.join(dostupne)}")
+    else:
+        kamera_izbor_var.set("")
+        status.set("Nije pronađena USB kamera")
+        zabiljezi("Nije pronađena dostupna USB kamera.")
+
+def pokreni_kameru():
+    global kamera, kamera_prozor, kamera_slika_widget, kamera_zadnji_frame
+    cv2 = uvezi_opencv()
+    if cv2 is None:
+        return
+    indeks = kamera_izbor_var.get()
+    if not indeks:
+        messagebox.showwarning(
+            "Nije izabrana kamera",
+            "Osvježi listu i izaberi povezanu USB kameru.",
+            parent=app
+        )
+        return
+
+    kamera = cv2.VideoCapture(int(indeks), cv2.CAP_DSHOW)
+    if not kamera.isOpened():
+        kamera.release()
+        kamera = None
+        messagebox.showerror(
+            "Kamera nije dostupna",
+            f"Nije moguće otvoriti kameru {indeks}. Provjeri vezu i pokušaj "
+            "osvježiti listu kamera.",
+            parent=app
+        )
+        return
+
+    uspjeh, kadar = kamera.read()
+    if not uspjeh:
+        kamera.release()
+        kamera = None
+        messagebox.showerror(
+            "Greška kamere",
+            "Kamera se otvorila, ali nije moguće pročitati sliku.",
+            parent=app
+        )
+        return
+
+    kamera_zadnji_frame = kadar
+    kamera_prozor = tk.Toplevel(app)
+    kamera_prozor.title(f"USB kamera {indeks} — pregled")
+    kamera_slika_widget = tk.Label(
+        kamera_prozor, text="Pokretanje pregleda...", bg="#202020", fg="white"
+    )
+    kamera_slika_widget.pack()
+    kamera_prozor.protocol("WM_DELETE_WINDOW", zaustavi_kameru)
+    postavi_fazu("kamera_prikaz")
+    status.set(f"USB kamera {indeks} je aktivna")
+    zabiljezi(f"Pokrenut pregled USB kamere {indeks}.")
+    osvjezi_pregled_kamere()
+
+def osvjezi_pregled_kamere():
+    global kamera_photo, kamera_zadnji_frame
+    if kamera is None or kamera_prozor is None or not kamera_prozor.winfo_exists():
+        return
+    cv2 = uvezi_opencv()
+    if cv2 is None:
+        zaustavi_kameru()
+        return
+    uspjeh, kadar = kamera.read()
+    if not uspjeh:
+        zaustavi_kameru()
+        messagebox.showerror(
+            "Greška kamere",
+            "USB kamera je prekinula slanje slike.",
+            parent=app
+        )
+        return
+
+    kamera_zadnji_frame = kadar
+    if kamera_writer is not None:
+        kamera_writer.write(kadar)
+    visina, sirina = kadar.shape[:2]
+    faktor = min(1, 1280 / sirina, 720 / visina)
+    prikazni_kadar = (
+        cv2.resize(kadar, (round(sirina * faktor), round(visina * faktor)))
+        if faktor < 1 else kadar
+    )
+    uspjeh, png = cv2.imencode(".png", prikazni_kadar)
+    if not uspjeh:
+        zaustavi_kameru()
+        messagebox.showerror(
+            "Greška kamere",
+            "Nije moguće prikazati sliku sa USB kamere.",
+            parent=app
+        )
+        return
+    kamera_photo = tk.PhotoImage(
+        data=base64.b64encode(png.tobytes()).decode("ascii")
+    )
+    kamera_slika_widget.config(image=kamera_photo, text="")
+    kamera_prozor.after(30, osvjezi_pregled_kamere)
+
+def kamera_screenshot(automatski=False):
+    if kamera_zadnji_frame is None:
+        return False
+    cv2 = uvezi_opencv()
+    if cv2 is None:
+        return False
+    putanja = naziv("png")
+    try:
+        if not cv2.imwrite(str(putanja), kamera_zadnji_frame):
+            raise RuntimeError(f"Nije moguće sačuvati screenshot u {putanja}.")
+    except (OSError, RuntimeError) as e:
+        zabiljezi(f"Greška pri izradi screenshota USB kamere: {e}")
+        if automatski:
+            status.set("Automatski screenshot nije uspio; timer je zaustavljen")
+            zaustavi_automatske_screenshotove()
+        else:
+            messagebox.showerror("Greška", str(e), parent=app)
+        return False
+    status.set(f"Sačuvano: {putanja.name}")
+    evidentiraj_snimljenu_sliku()
+    zabiljezi(f"Screenshot USB kamere sačuvan: {putanja}")
+    return True
+
+def postavke_kamere():
+    if kamera is None:
+        return
+    cv2 = uvezi_opencv()
+    if cv2 is None:
+        return
+    try:
+        podrzano = kamera.set(cv2.CAP_PROP_SETTINGS, 0)
+    except cv2.error as e:
+        zabiljezi(f"Greška pri otvaranju postavki kamere: {e}")
+        messagebox.showerror(
+            "Postavke kamere",
+            f"Nije moguće otvoriti postavke kamere:\n{e}",
+            parent=app
+        )
+        return
+    if not podrzano:
+        status.set("Kamera ne podržava Windows postavke fokusa")
+        messagebox.showinfo(
+            "Postavke fokusa nisu dostupne",
+            "Ova kamera ili njen drajver ne izlažu Windows postavke fokusa. "
+            "Ako kamera podržava ručni fokus, provjeri njenu aplikaciju ili "
+            "postavke proizvođača.",
+            parent=app
+        )
+        zabiljezi("Kamera/drajver ne podržava OpenCV postavke uređaja.")
+        return
+    status.set("Zatvori prozor postavki kamere za nastavak")
+    zabiljezi("Otvorene Windows postavke USB kamere.")
+
+def kamera_video():
+    global kamera_writer, kamera_video_putanja
+    cv2 = uvezi_opencv()
+    if cv2 is None:
+        return
+    if kamera_writer is not None:
+        kamera_writer.release()
+        kamera_writer = None
+        putanja = kamera_video_putanja
+        kamera_video_putanja = None
+        postavi_fazu("kamera_prikaz")
+        prijavi_zavrsetak_videa(putanja)
+        return
+    if kamera_zadnji_frame is None:
+        return
+
+    visina, sirina = kamera_zadnji_frame.shape[:2]
+    fps = kamera.get(cv2.CAP_PROP_FPS)
+    if not 1 <= fps <= 120:
+        fps = 30.0
+    putanja = naziv("mp4")
+    writer = cv2.VideoWriter(
+        str(putanja),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (sirina, visina)
+    )
+    if not writer.isOpened():
+        writer.release()
+        messagebox.showerror(
+            "Greška snimanja",
+            "Nije moguće pokrenuti MP4 snimanje. Provjeri podršku za MP4 "
+            "kodek u instalaciji OpenCV-a.",
+            parent=app
+        )
+        return
+    kamera_writer = writer
+    kamera_video_putanja = putanja
+    postavi_fazu("kamera_snimanje")
+    status.set(f"Snimanje USB kamere: {putanja.name}")
+    zabiljezi(f"Pokrenuto MP4 snimanje USB kamere: {putanja}")
+
+def zaustavi_kameru():
+    global kamera, kamera_writer, kamera_prozor, kamera_slika_widget
+    global kamera_photo, kamera_zadnji_frame, kamera_video_putanja
+    zaustavi_automatske_screenshotove()
+    putanja = kamera_video_putanja if kamera_writer is not None else None
+    if kamera_writer is not None:
+        kamera_writer.release()
+        kamera_writer = None
+    if kamera is not None:
+        kamera.release()
+        kamera = None
+    if kamera_prozor is not None and kamera_prozor.winfo_exists():
+        kamera_prozor.destroy()
+    kamera_prozor = None
+    kamera_slika_widget = None
+    kamera_photo = None
+    kamera_zadnji_frame = None
+    kamera_video_putanja = None
+    postavi_fazu("spremno")
+    status.set("USB kamera je zaustavljena")
+    zabiljezi("USB kamera je zaustavljena.")
+    if putanja:
+        prijavi_zavrsetak_videa(putanja)
+
 def otvori_folder():
     os.startfile(folder)
 
 app = tk.Tk()
-app.title("Android Screen Recorder")
-app.geometry("460x620")
+app.title("Screen Recorder")
+app.geometry("506x620")
 app.configure(bg="#EAF2FB")
-app.update_idletasks()
-pozicioniraj_glavni_prozor_desno()
 
-status = tk.StringVar(value="Spremno")
+status = tk.StringVar(value="Izaberi izvor snimanja")
 broj_slika_status = tk.StringVar(value="Snimljeno slika: 0")
+adb_status = tk.StringVar()
+adb_verzija_localna = verzija_adb()
 rucni_pomak_aktivan = tk.BooleanVar(value=False)
 rucni_pomak = tk.StringVar(value="85")
+kamera_izbor_var = tk.StringVar()
+timer_interval_var = tk.StringVar(value="3")
+timer_status = tk.StringVar(value="Automatski screenshotovi su isključeni")
 
 header = tk.Frame(app, bg="#1557A0", padx=20, pady=16)
 header.pack(fill="x")
-
 icon = tk.Canvas(
     header, width=40, height=40,
     bg="#1557A0", highlightthickness=0
@@ -984,14 +1450,14 @@ naslov = tk.Frame(header, bg="#1557A0")
 naslov.pack(side="left")
 tk.Label(
     naslov,
-    text="Android Screen Recorder",
+    text="Screen Recorder",
     bg="#1557A0",
     fg="white",
     font=("Segoe UI", 16, "bold")
 ).pack(anchor="w")
 tk.Label(
     naslov,
-    text="Upravljanje prikazom i snimanjem telefona",
+    text="Android telefon ili USB kamera",
     bg="#1557A0",
     fg="#D8E8FA",
     font=("Segoe UI", 9)
@@ -1000,37 +1466,72 @@ tk.Label(
 sadrzaj = tk.Frame(app, bg="#FFFFFF", padx=20, pady=14)
 sadrzaj.pack(fill="both", expand=True, padx=16, pady=14)
 
+izbor_rezima = tk.Frame(sadrzaj, bg="#FFFFFF")
+izbor_rezima.pack(fill="both", expand=True)
 tk.Label(
-    sadrzaj,
+    izbor_rezima,
+    text="IZABERI IZVOR SNIMANJA",
+    bg="#FFFFFF",
+    fg="#51677F",
+    font=("Segoe UI", 10, "bold")
+).pack(anchor="w", pady=(4, 12))
+tk.Button(
+    izbor_rezima,
+    text="ANDROID TELEFON  ·  SCRCPY",
+    command=lambda: prikazi_rezim("android"),
+    height=3
+).pack(fill="x", pady=5)
+tk.Button(
+    izbor_rezima,
+    text="USB EKSTERNA KAMERA",
+    command=lambda: prikazi_rezim("kamera"),
+    height=3
+).pack(fill="x", pady=5)
+tk.Button(
+    izbor_rezima,
+    text="IZVLAČENJE PODATAKA IZ TELEFONA  ·  ADB",
+    command=lambda: pokreni_ekstrakciju(),
+    height=3
+).pack(fill="x", pady=5)
+
+android_panel = tk.Frame(sadrzaj, bg="#FFFFFF")
+kamera_panel = tk.Frame(sadrzaj, bg="#FFFFFF")
+
+tk.Button(
+    android_panel, text="← Promijeni izvor",
+    command=lambda: prikazi_izbor_rezima(),
+    bg="#E8F1FC", fg="#1456A0", relief="flat", bd=0, pady=6
+).pack(fill="x", pady=(0, 8))
+tk.Label(
+    android_panel,
     text="1. KORAK  ·  POKRETANJE",
     bg="#FFFFFF",
     fg="#51677F",
     font=("Segoe UI", 9, "bold")
 ).pack(anchor="w", pady=(0, 6))
 dugmad["pokreni"] = tk.Button(
-    sadrzaj, text="POKRENI SCRCPY", command=pokreni, height=2
+    android_panel, text="POKRENI SCRCPY", command=pokreni, height=2
 )
 dugmad["pokreni"].pack(fill="x", pady=(0, 12))
-
 tk.Label(
-    sadrzaj,
+    android_panel,
     text="2. KORAK  ·  IZABERI ŠTA ŽELIŠ SNIMITI",
     bg="#FFFFFF",
     fg="#51677F",
     font=("Segoe UI", 9, "bold")
 ).pack(anchor="w", pady=(0, 6))
 dugmad["screenshot"] = tk.Button(
-    sadrzaj, text="Napravi screenshot", command=screenshot, height=2
+    android_panel, text="Napravi screenshot", command=screenshot, height=2
 )
 dugmad["screenshot"].pack(fill="x", pady=3)
 dugmad["razgovor"] = tk.Button(
-    sadrzaj,
+    android_panel,
     text="Snimi razgovor (screenshotovi sa preklapanjem)",
     command=snimi_razgovor,
     height=2
 )
 dugmad["razgovor"].pack(fill="x", pady=3)
-pomak_okvir = tk.Frame(sadrzaj, bg="#FFFFFF")
+pomak_okvir = tk.Frame(android_panel, bg="#FFFFFF")
 pomak_okvir.pack(fill="x", pady=(0, 3))
 tk.Checkbutton(
     pomak_okvir, text="Ručni pomak pri snimanju razgovora:",
@@ -1044,15 +1545,101 @@ tk.Label(
     pomak_okvir, text="% visine", bg="#FFFFFF", font=("Segoe UI", 9)
 ).pack(side="left")
 dugmad["video"] = tk.Button(
-    sadrzaj, text="Pokreni MP4 snimanje", command=video, height=2
+    android_panel, text="Pokreni MP4 snimanje", command=video, height=2
 )
 dugmad["video"].pack(fill="x", pady=3)
 dugmad["zaustavi"] = tk.Button(
-    sadrzaj, text="ZAUSTAVI SCRCPY", command=zaustavi, height=2
+    android_panel, text="ZAUSTAVI SCRCPY", command=zaustavi, height=2
 )
 dugmad["zaustavi"].pack(fill="x", pady=(8, 5))
 
-folder_dugmad = tk.Frame(sadrzaj, bg="#FFFFFF")
+tk.Button(
+    kamera_panel, text="← Promijeni izvor",
+    command=lambda: prikazi_izbor_rezima(),
+    bg="#E8F1FC", fg="#1456A0", relief="flat", bd=0, pady=6
+).pack(fill="x", pady=(0, 12))
+tk.Label(
+    kamera_panel,
+    text="USB KAMERA",
+    bg="#FFFFFF",
+    fg="#51677F",
+    font=("Segoe UI", 9, "bold")
+).pack(anchor="w", pady=(0, 6))
+kamera_red = tk.Frame(kamera_panel, bg="#FFFFFF")
+kamera_red.pack(fill="x", pady=(0, 8))
+tk.Label(
+    kamera_red, text="Kamera indeks:", bg="#FFFFFF", fg="#243B53"
+).pack(side="left")
+kamera_izbor = ttk.Combobox(
+    kamera_red, textvariable=kamera_izbor_var, state="readonly", width=12
+)
+kamera_izbor.pack(side="left", padx=6)
+tk.Button(
+    kamera_red, text="Osvježi", command=osvjezi_kamere,
+    bg="#E8F1FC", fg="#1456A0", relief="flat", bd=0, padx=10, pady=4
+).pack(side="left")
+dugmad["kamera_pokreni"] = tk.Button(
+    kamera_panel, text="POKRENI PREGLED KAMERE",
+    command=pokreni_kameru, height=2
+)
+dugmad["kamera_pokreni"].pack(fill="x", pady=4)
+dugmad["kamera_screenshot"] = tk.Button(
+    kamera_panel, text="Napravi screenshot",
+    command=kamera_screenshot, height=2
+)
+dugmad["kamera_screenshot"].pack(fill="x", pady=4)
+dugmad["kamera_postavke"] = tk.Button(
+    kamera_panel, text="Postavke kamere / fokus",
+    command=postavke_kamere, height=2
+)
+dugmad["kamera_postavke"].pack(fill="x", pady=4)
+dugmad["kamera_video"] = tk.Button(
+    kamera_panel, text="Pokreni MP4 snimanje",
+    command=kamera_video, height=2
+)
+dugmad["kamera_video"].pack(fill="x", pady=4)
+dugmad["kamera_zaustavi"] = tk.Button(
+    kamera_panel, text="ZAUSTAVI KAMERU",
+    command=zaustavi_kameru, height=2
+)
+dugmad["kamera_zaustavi"].pack(fill="x", pady=(8, 5))
+tk.Label(
+    kamera_panel,
+    text="Pregled kamere otvara se u posebnom prozoru.",
+    bg="#FFFFFF",
+    fg="#51677F",
+    font=("Segoe UI", 9)
+).pack(anchor="w", pady=(4, 0))
+
+zajednicke_opcije = tk.Frame(sadrzaj, bg="#FFFFFF")
+timer_okvir = tk.Frame(zajednicke_opcije, bg="#FFFFFF")
+timer_okvir.pack(fill="x", pady=(4, 0))
+tk.Label(
+    timer_okvir, text="Screenshot svakih:", bg="#FFFFFF", fg="#243B53"
+).pack(side="left")
+tk.Spinbox(
+    timer_okvir, from_=1, to=3600, increment=1, width=5,
+    textvariable=timer_interval_var
+).pack(side="left", padx=(6, 4))
+tk.Label(
+    timer_okvir, text="sekundi", bg="#FFFFFF", fg="#243B53"
+).pack(side="left")
+dugmad["automatski_screenshot"] = tk.Button(
+    zajednicke_opcije,
+    text="Pokreni automatske screenshotove",
+    command=ukljuci_automatske_screenshotove,
+    height=2
+)
+dugmad["automatski_screenshot"].pack(fill="x", pady=(5, 0))
+tk.Label(
+    zajednicke_opcije,
+    textvariable=timer_status,
+    bg="#FFFFFF",
+    fg="#174A7E",
+    font=("Segoe UI", 9, "bold")
+).pack(anchor="w", pady=(3, 0))
+
+folder_dugmad = tk.Frame(zajednicke_opcije, bg="#FFFFFF")
 folder_dugmad.pack(fill="x", pady=(10, 0))
 for tekst, komanda in (
     ("Izaberi folder", izaberi_folder),
@@ -1073,9 +1660,8 @@ for tekst, komanda in (
         padx=10,
         pady=7
     ).pack(side="left", expand=True, fill="x", padx=3)
-
 tk.Button(
-    sadrzaj,
+    zajednicke_opcije,
     text="Prikaži privremeni log sesije",
     command=prikazi_log,
     bg="#D8E8FA",
@@ -1094,7 +1680,7 @@ statusna_traka.pack(fill="x", side="bottom")
 tk.Label(
     statusna_traka,
     textvariable=status,
-    wraplength=420,
+    wraplength=470,
     bg="#D8E8FA",
     fg="#174A7E",
     font=("Segoe UI", 9)
@@ -1106,12 +1692,88 @@ tk.Label(
     fg="#174A7E",
     font=("Segoe UI", 9, "bold")
 ).pack(anchor="e")
+tk.Label(
+    statusna_traka,
+    textvariable=adb_status,
+    bg="#D8E8FA",
+    fg="#174A7E",
+    font=("Segoe UI", 8)
+).pack(anchor="w")
+
+def pokreni_ekstrakciju():
+    if getattr(sys, "frozen", False):
+        skripta = APP_DIR / "izvuci_telefon.exe"
+        komanda = [str(skripta)]
+    else:
+        skripta = APP_DIR / "izvuci_telefon.py"
+        komanda = [sys.executable, str(skripta)]
+    if not skripta.exists():
+        messagebox.showerror("Greška", f"Nije pronađena skripta:\n{skripta}")
+        return
+    if not messagebox.askyesno(
+        "Izvlačenje podataka",
+        "Kopirat će se javna memorija telefona (/sdcard) u folder:\n"
+        f"{folder / 'EKSTRAKCIJE'}\n\n"
+        "Telefon mora biti spojen i otključan. Nastaviti?"
+    ):
+        return
+    okolina = os.environ.copy()
+    okolina["IZVUCI_PAUZA"] = "1"
+    subprocess.Popen(
+        komanda + ["--izlaz", str(folder / "EKSTRAKCIJE")],
+        cwd=str(APP_DIR),
+        env=okolina,
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+    )
+
+
+def prikazi_rezim(novi_rezim):
+    global rezim
+    rezim = novi_rezim
+    izbor_rezima.pack_forget()
+    if rezim == "android":
+        kamera_panel.pack_forget()
+        android_panel.pack(fill="both", expand=True)
+        status.set("Izabran Android / scrcpy režim")
+    else:
+        android_panel.pack_forget()
+        kamera_panel.pack(fill="both", expand=True)
+        status.set("Izabran režim USB kamere")
+        osvjezi_kamere()
+    zajednicke_opcije.pack(fill="x")
+    osvjezi_dugmad()
+
+def prikazi_izbor_rezima():
+    if faza != "spremno":
+        messagebox.showwarning(
+            "Snimanje je aktivno",
+            "Zaustavi trenutno snimanje prije promjene režima.",
+            parent=app
+        )
+        return
+    android_panel.pack_forget()
+    kamera_panel.pack_forget()
+    zajednicke_opcije.pack_forget()
+    izbor_rezima.pack(fill="both", expand=True)
+    status.set("Izaberi izvor snimanja")
 
 osvjezi_dugmad()
+app.update_idletasks()
+visina_za_rezim = max(
+    android_panel.winfo_reqheight(),
+    kamera_panel.winfo_reqheight()
+)
+visina_minimalna = max(
+    620,
+    app.winfo_reqheight()
+    - izbor_rezima.winfo_reqheight()
+    + visina_za_rezim
+    + zajednicke_opcije.winfo_reqheight()
+    + 16
+)
+app.geometry(f"506x{visina_minimalna}")
+app.minsize(506, visina_minimalna)
 pozicioniraj_glavni_prozor_desno()
-
 zabiljezi("Aplikacija je pokrenuta. Log se čuva samo dok je aplikacija otvorena.")
-
+osvjezi_adb_status()
 app.mainloop()
-
-
