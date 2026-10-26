@@ -104,6 +104,50 @@ def osvjezi_adb_status():
     adb_status.set(f"ADB {adb_verzija_localna}: server {server_status}")
     app.after(2000, osvjezi_adb_status)
 
+def adb_server_aktivan():
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", ADB_SERVER_PORT), timeout=0.4
+        ):
+            return True
+    except OSError:
+        return False
+
+def ugasi_adb_server():
+    if not adb_server_aktivan():
+        return
+    zabiljezi(f"ADB server je ostao aktivan na portu {ADB_SERVER_PORT}, gasim ga.")
+    bez_prozora = subprocess.CREATE_NO_WINDOW
+    try:
+        subprocess.run(
+            [str(ADB_EXE), "-P", str(ADB_SERVER_PORT), "kill-server"],
+            capture_output=True,
+            timeout=10,
+            creationflags=bez_prozora
+        )
+        if adb_server_aktivan():
+            # Rezerva: prekini samo adb.exe koji sluša na tom portu
+            subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    "Get-NetTCPConnection -State Listen "
+                    f"-LocalPort {ADB_SERVER_PORT} -ErrorAction SilentlyContinue "
+                    "| ForEach-Object { Get-Process -Id $_.OwningProcess } "
+                    "| Where-Object { $_.ProcessName -eq 'adb' } "
+                    "| Stop-Process -Force"
+                ],
+                capture_output=True,
+                timeout=15,
+                creationflags=bez_prozora
+            )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        zabiljezi(f"Greška pri gašenju ADB servera: {e}")
+        return
+    if adb_server_aktivan():
+        zabiljezi(f"ADB server na portu {ADB_SERVER_PORT} nije ugašen.")
+    else:
+        zabiljezi(f"ADB server na portu {ADB_SERVER_PORT} je ugašen.")
+
 def centriraj_prozor(prozor, roditelj=None):
     prozor.update_idletasks()
     sirina = prozor.winfo_width()
@@ -335,6 +379,7 @@ def prati_proces(novi_proces, pokrenuto_snimanje, putanja=None):
     snimanje = False
     putanja_snimanja = None
     postavi_fazu("spremno")
+    ugasi_adb_server()
     if pokrenuto_snimanje:
         prijavi_zavrsetak_videa(putanja)
     else:
@@ -368,11 +413,16 @@ def pokreni_scrcpy(komanda, pokrenuto_snimanje=False, putanja=None):
     ]
     okruzenje = os.environ.copy()
     okruzenje["ADB_SERVER_SOCKET"] = f"tcp:localhost:{ADB_SERVER_PORT}"
+    # Skrivena konzola (ne CREATE_NO_WINDOW) da CTRL_BREAK_EVENT i dalje radi
+    skriveno = subprocess.STARTUPINFO()
+    skriveno.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    skriveno.wShowWindow = subprocess.SW_HIDE
     try:
         proces = subprocess.Popen(
             komanda,
             cwd=SCRCPY_EXE.parent,
             env=okruzenje,
+            startupinfo=skriveno,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
         )
     except OSError as e:
@@ -515,6 +565,7 @@ def zaustavi():
         "MP4 snimanje je zaustavljeno." if bilo_snimanje
         else "scrcpy sesija je zaustavljena."
     )
+    ugasi_adb_server()
     if bilo_snimanje and putanja_videa:
         prijavi_zavrsetak_videa(putanja_videa)
     else:
