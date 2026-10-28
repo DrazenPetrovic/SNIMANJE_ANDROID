@@ -75,10 +75,93 @@ def zabiljezi(poruka):
         tekst_loga.see("end")
         tekst_loga.config(state="disabled")
 
+overlay_slike = None
+overlay_slike_job = None
+
+def prikazi_overlay_slike(broj):
+    global overlay_slike, overlay_slike_job
+    try:
+        app.update_idletasks()
+        if overlay_slike_job is not None:
+            app.after_cancel(overlay_slike_job)
+            overlay_slike_job = None
+        if overlay_slike is not None and overlay_slike.winfo_exists():
+            overlay_slike.destroy()
+        okvir = tk.Toplevel(app)
+        okvir.overrideredirect(True)
+        okvir.attributes("-topmost", True)
+        okvir.attributes("-alpha", 0.88)
+        okvir.configure(bg="#174A7E")
+        okvir.geometry(
+            f"{app.winfo_width()}x{app.winfo_height()}"
+            f"+{app.winfo_rootx()}+{app.winfo_rooty()}"
+        )
+        tk.Label(
+            okvir,
+            text=f"\U0001F4F7\n{broj}",
+            bg="#174A7E",
+            fg="white",
+            font=("Segoe UI", 110, "bold"),
+        ).pack(expand=True, fill="both")
+        overlay_slike = okvir
+        overlay_slike_job = app.after(900, sakrij_overlay_slike)
+    except tk.TclError:
+        overlay_slike = None
+
+def sakrij_overlay_slike():
+    global overlay_slike, overlay_slike_job
+    overlay_slike_job = None
+    if overlay_slike is not None:
+        try:
+            overlay_slike.destroy()
+        except tk.TclError:
+            pass
+        overlay_slike = None
+
+overlay_zauzeto = None
+
+def prikazi_zauzeto(tekst):
+    global overlay_zauzeto
+    sakrij_zauzeto()
+    try:
+        app.update_idletasks()
+        okvir = tk.Toplevel(app)
+        okvir.overrideredirect(True)
+        okvir.attributes("-topmost", True)
+        okvir.attributes("-alpha", 0.92)
+        okvir.configure(bg="#795800", cursor="watch")
+        okvir.geometry(
+            f"{app.winfo_width()}x{app.winfo_height()}"
+            f"+{app.winfo_rootx()}+{app.winfo_rooty()}"
+        )
+        tk.Label(
+            okvir,
+            text=f"\u23F3\n{tekst}\nSačekaj, ne klikći.",
+            bg="#795800",
+            fg="white",
+            font=("Segoe UI", 28, "bold"),
+            wraplength=max(app.winfo_width() - 40, 200),
+            cursor="watch",
+        ).pack(expand=True, fill="both")
+        overlay_zauzeto = okvir
+        okvir.update()
+    except tk.TclError:
+        overlay_zauzeto = None
+
+def sakrij_zauzeto():
+    global overlay_zauzeto
+    if overlay_zauzeto is not None:
+        try:
+            overlay_zauzeto.destroy()
+        except tk.TclError:
+            pass
+        overlay_zauzeto = None
+
 def evidentiraj_snimljenu_sliku():
     global broj_snimljenih_slika
     broj_snimljenih_slika += 1
     broj_slika_status.set(f"Snimljeno slika: {broj_snimljenih_slika}")
+    prikazi_overlay_slike(broj_snimljenih_slika)
 
 def verzija_adb():
     if not ADB_EXE.is_file():
@@ -89,8 +172,7 @@ def verzija_adb():
             capture_output=True,
             stdin=subprocess.DEVNULL,
             text=True,
-            timeout=5,
-            creationflags=NO_WINDOW
+            timeout=5
         )
     except (OSError, subprocess.TimeoutExpired):
         return "nije dostupna"
@@ -110,6 +192,50 @@ def osvjezi_adb_status():
         server_status = f"neaktivan na portu {ADB_SERVER_PORT}"
     adb_status.set(f"ADB {adb_verzija_localna}: server {server_status}")
     adb_status_job = app.after(2000, osvjezi_adb_status)
+
+def adb_server_aktivan():
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", ADB_SERVER_PORT), timeout=0.4
+        ):
+            return True
+    except OSError:
+        return False
+
+def ugasi_adb_server():
+    if not adb_server_aktivan():
+        return
+    zabiljezi(f"ADB server je ostao aktivan na portu {ADB_SERVER_PORT}, gasim ga.")
+    bez_prozora = subprocess.CREATE_NO_WINDOW
+    try:
+        subprocess.run(
+            [str(ADB_EXE), "-P", str(ADB_SERVER_PORT), "kill-server"],
+            capture_output=True,
+            timeout=10,
+            creationflags=bez_prozora
+        )
+        if adb_server_aktivan():
+            # Rezerva: prekini samo adb.exe koji sluša na tom portu
+            subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    "Get-NetTCPConnection -State Listen "
+                    f"-LocalPort {ADB_SERVER_PORT} -ErrorAction SilentlyContinue "
+                    "| ForEach-Object { Get-Process -Id $_.OwningProcess } "
+                    "| Where-Object { $_.ProcessName -eq 'adb' } "
+                    "| Stop-Process -Force"
+                ],
+                capture_output=True,
+                timeout=15,
+                creationflags=bez_prozora
+            )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        zabiljezi(f"Greška pri gašenju ADB servera: {e}")
+        return
+    if adb_server_aktivan():
+        zabiljezi(f"ADB server na portu {ADB_SERVER_PORT} nije ugašen.")
+    else:
+        zabiljezi(f"ADB server na portu {ADB_SERVER_PORT} je ugašen.")
 
 def centriraj_prozor(prozor, roditelj=None):
     prozor.update_idletasks()
@@ -269,6 +395,7 @@ def postavi_fazu(nova_faza):
 
 def potvrdi_pokretanje(novi_proces, pokrenuto_snimanje, putanja=None):
     global proces, snimanje, putanja_snimanja
+    sakrij_zauzeto()
     if proces is not novi_proces:
         return
     if novi_proces.poll() is not None:
@@ -342,6 +469,7 @@ def prati_proces(novi_proces, pokrenuto_snimanje, putanja=None):
     snimanje = False
     putanja_snimanja = None
     postavi_fazu("spremno")
+    ugasi_adb_server()
     if pokrenuto_snimanje:
         prijavi_zavrsetak_videa(putanja)
     else:
@@ -375,16 +503,12 @@ def pokreni_scrcpy(komanda, pokrenuto_snimanje=False, putanja=None):
     ]
     okruzenje = os.environ.copy()
     okruzenje["ADB_SERVER_SOCKET"] = f"tcp:localhost:{ADB_SERVER_PORT}"
-    # scrcpy koristi isti adb kao aplikacija; različite verzije adb-a
-    # međusobno ruše i ponovo pokreću server.
-    okruzenje["ADB"] = str(ADB_EXE)
     try:
         proces = subprocess.Popen(
             komanda,
             cwd=SCRCPY_EXE.parent,
             env=okruzenje,
-            stdin=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | NO_WINDOW
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
         )
     except OSError as e:
         proces = None
@@ -406,6 +530,7 @@ def pokreni_scrcpy(komanda, pokrenuto_snimanje=False, putanja=None):
     zabiljezi("Pokretanje scrcpy...")
     status.set("Provjeravam da li se scrcpy uspješno pokrenuo...")
     postavi_fazu("pokretanje")
+    prikazi_zauzeto("Pokreće se scrcpy...")
     app.after(
         1500,
         potvrdi_pokretanje,
@@ -421,8 +546,7 @@ def proveri_telefon():
             capture_output=True,
             stdin=subprocess.DEVNULL,
             text=True,
-            timeout=10,
-            creationflags=NO_WINDOW
+            timeout=10
         )
     except FileNotFoundError:
         status.set("ADB nije pronađen")
@@ -556,6 +680,7 @@ def zaustavi():
         "MP4 snimanje je zaustavljeno." if bilo_snimanje
         else "scrcpy sesija je zaustavljena."
     )
+    ugasi_adb_server()
     if bilo_snimanje and putanja_videa:
         prijavi_zavrsetak_videa(putanja_videa)
     else:
@@ -665,9 +790,7 @@ def screenshot(automatski=False):
                 ],
                 stdout=fajl,
                 stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                timeout=20,
-                creationflags=NO_WINDOW
+                timeout=20
             )
         if rezultat.returncode != 0:
             putanja.unlink(missing_ok=True)
@@ -692,9 +815,7 @@ def adb_poziv(argumenti, timeout=20):
         rezultat = subprocess.run(
             [str(ADB_EXE), "-P", str(ADB_SERVER_PORT), *argumenti],
             capture_output=True,
-            stdin=subprocess.DEVNULL,
-            timeout=timeout,
-            creationflags=NO_WINDOW
+            timeout=timeout
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError(f"ADB naredba nije uspjela: {e}") from e
@@ -1061,7 +1182,7 @@ def geste_pomjeri(prema_pocetku, udio=None):
     y_pocetak, y_kraj = (y_gore, y_dole) if prema_pocetku else (y_dole, y_gore)
     adb_poziv(
         ["shell", "input", "swipe", str(sredina), str(y_pocetak),
-         str(sredina), str(y_kraj), "800"],
+         str(sredina), str(y_kraj), "600"],
         timeout=10
     )
 
