@@ -5,10 +5,11 @@ from tkinter import ttk
 from pathlib import Path
 from datetime import datetime
 import base64
+import ctypes
+from ctypes import wintypes
 import re
 import subprocess
 import os
-import signal
 import socket
 import sys
 
@@ -20,6 +21,8 @@ APP_DIR = (
 ADB_EXE = APP_DIR / "platform-tools" / "adb.exe"
 SCRCPY_EXE = APP_DIR / "scrcpy" / "scrcpy.exe"
 ADB_SERVER_PORT = 5038
+# U --windowed exe verziji svaki konzolni program bi otvorio crni prozor.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 folder = Path.home() / "Pictures" / "SNIMCI"
 folder.mkdir(parents=True, exist_ok=True)
@@ -48,6 +51,7 @@ kamera_zadnji_frame = None
 kamera_video_putanja = None
 automatski_screenshot_aktivan = False
 automatski_screenshot_job = None
+adb_status_job = None
 boje_dugmadi = {
     "pokreni": ("#1769D2", "white"),
     "video": ("#D9485F", "white"),
@@ -83,8 +87,10 @@ def verzija_adb():
         rezultat = subprocess.run(
             [str(ADB_EXE), "version"],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
-            timeout=5
+            timeout=5,
+            creationflags=NO_WINDOW
         )
     except (OSError, subprocess.TimeoutExpired):
         return "nije dostupna"
@@ -94,6 +100,7 @@ def verzija_adb():
     return poklapanje.group(1).strip() if poklapanje else "nepoznata"
 
 def osvjezi_adb_status():
+    global adb_status_job
     try:
         with socket.create_connection(
             ("127.0.0.1", ADB_SERVER_PORT), timeout=0.4
@@ -102,7 +109,7 @@ def osvjezi_adb_status():
     except OSError:
         server_status = f"neaktivan na portu {ADB_SERVER_PORT}"
     adb_status.set(f"ADB {adb_verzija_localna}: server {server_status}")
-    app.after(2000, osvjezi_adb_status)
+    adb_status_job = app.after(2000, osvjezi_adb_status)
 
 def centriraj_prozor(prozor, roditelj=None):
     prozor.update_idletasks()
@@ -368,12 +375,16 @@ def pokreni_scrcpy(komanda, pokrenuto_snimanje=False, putanja=None):
     ]
     okruzenje = os.environ.copy()
     okruzenje["ADB_SERVER_SOCKET"] = f"tcp:localhost:{ADB_SERVER_PORT}"
+    # scrcpy koristi isti adb kao aplikacija; različite verzije adb-a
+    # međusobno ruše i ponovo pokreću server.
+    okruzenje["ADB"] = str(ADB_EXE)
     try:
         proces = subprocess.Popen(
             komanda,
             cwd=SCRCPY_EXE.parent,
             env=okruzenje,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | NO_WINDOW
         )
     except OSError as e:
         proces = None
@@ -408,8 +419,10 @@ def proveri_telefon():
         rezultat = subprocess.run(
             [str(ADB_EXE), "-P", str(ADB_SERVER_PORT), "devices"],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
-            timeout=10
+            timeout=10,
+            creationflags=NO_WINDOW
         )
     except FileNotFoundError:
         status.set("ADB nije pronađen")
@@ -469,14 +482,42 @@ def pokreni():
     zabiljezi("----- Nova scrcpy sesija -----")
     pokreni_scrcpy(["scrcpy"])
 
-def zaustavi_proces():
-    if proces and proces.poll() is None:
-        try:
-            proces.send_signal(signal.CTRL_BREAK_EVENT)
-            proces.wait(timeout=10)
-        except (OSError, subprocess.TimeoutExpired) as e:
+def zatvori_prozore_procesa(pid):
+    # WM_CLOSE je isto kao klik na X: scrcpy uredno završi i MP4 fajl.
+    # CTRL_BREAK ne radi iz --windowed exe-a jer on nema konzolu.
+    user32 = ctypes.windll.user32
+    pronadjeni = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def obradi(hwnd, _lparam):
+        vlasnik = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(vlasnik))
+        if vlasnik.value == pid and user32.IsWindowVisible(hwnd):
+            pronadjeni.append(hwnd)
+        return True
+
+    user32.EnumWindows(obradi, 0)
+    for hwnd in pronadjeni:
+        user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+    return bool(pronadjeni)
+
+def zaustavi_proces(tiho=False):
+    if not proces or proces.poll() is not None:
+        return True
+    try:
+        if zatvori_prozore_procesa(proces.pid):
+            try:
+                proces.wait(timeout=10)
+                return True
+            except subprocess.TimeoutExpired:
+                zabiljezi("scrcpy se nije zatvorio na vrijeme; prisilno gašenje.")
+        proces.kill()
+        proces.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        zabiljezi(f"Greška pri zaustavljanju scrcpy: {e}")
+        if not tiho:
             messagebox.showerror("Greška", str(e), parent=app)
-            return False
+        return False
     return True
 
 def video():
@@ -624,7 +665,9 @@ def screenshot(automatski=False):
                 ],
                 stdout=fajl,
                 stderr=subprocess.PIPE,
-                timeout=20
+                stdin=subprocess.DEVNULL,
+                timeout=20,
+                creationflags=NO_WINDOW
             )
         if rezultat.returncode != 0:
             putanja.unlink(missing_ok=True)
@@ -649,7 +692,9 @@ def adb_poziv(argumenti, timeout=20):
         rezultat = subprocess.run(
             [str(ADB_EXE), "-P", str(ADB_SERVER_PORT), *argumenti],
             capture_output=True,
-            timeout=timeout
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            creationflags=NO_WINDOW
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError(f"ADB naredba nije uspjela: {e}") from e
@@ -1420,10 +1465,86 @@ def zaustavi_kameru():
 def otvori_folder():
     os.startfile(folder)
 
+def ugasi_adb_server():
+    try:
+        subprocess.run(
+            [str(ADB_EXE), "-P", str(ADB_SERVER_PORT), "kill-server"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=5,
+            creationflags=NO_WINDOW
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    # Rezerva: ugasi preostale adb.exe procese iz foldera aplikacije
+    # (platform-tools i scrcpy), ali ne i tuđe adb procese.
+    folder_aplikacije = str(APP_DIR).replace("'", "''") + "\\"
+    skripta = (
+        "Get-CimInstance Win32_Process -Filter \"Name='adb.exe'\" | "
+        "Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith("
+        f"'{folder_aplikacije}', [StringComparison]::OrdinalIgnoreCase) }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+        "-ErrorAction SilentlyContinue }"
+    )
+    try:
+        aktivni = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq adb.exe", "/NH"],
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            creationflags=NO_WINDOW
+        )
+        if "adb.exe" in aktivni.stdout.lower():
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", skripta],
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                timeout=15,
+                creationflags=NO_WINDOW
+            )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+def zatvori_aplikaciju():
+    global arhiva_aktivna, kamera, kamera_writer
+    aktivno_snimanje = snimanje or kamera_writer is not None or arhiva_aktivna
+    if aktivno_snimanje and not messagebox.askyesno(
+        "Snimanje je aktivno",
+        "Snimanje je u toku. Zaustaviti snimanje i zatvoriti aplikaciju?",
+        parent=app
+    ):
+        return
+    # Svaki korak je zaštićen da greška u jednom ne spriječi zatvaranje.
+    koraci = [zaustavi_automatske_screenshotove]
+    if adb_status_job is not None:
+        koraci.append(lambda: app.after_cancel(adb_status_job))
+    koraci.append(lambda: zaustavi_proces(tiho=True))
+    if kamera_writer is not None:
+        koraci.append(kamera_writer.release)
+    if kamera is not None:
+        koraci.append(kamera.release)
+    koraci.append(ugasi_adb_server)
+    arhiva_aktivna = False
+    for korak in koraci:
+        try:
+            korak()
+        except Exception as e:
+            zabiljezi(f"Greška pri zatvaranju: {e}")
+    kamera_writer = None
+    kamera = None
+    app.destroy()
+
+def prijavi_gresku_callbacka(tip, vrijednost, _traceback):
+    # U --windowed exe-u nema stderr-a, pa greške idu u log sesije.
+    zabiljezi(f"Neočekivana greška: {tip.__name__}: {vrijednost}")
+
 app = tk.Tk()
 app.title("Screen Recorder")
 app.geometry("506x620")
 app.configure(bg="#EAF2FB")
+app.protocol("WM_DELETE_WINDOW", zatvori_aplikaciju)
+app.report_callback_exception = prijavi_gresku_callbacka
 
 status = tk.StringVar(value="Izaberi izvor snimanja")
 broj_slika_status = tk.StringVar(value="Snimljeno slika: 0")
