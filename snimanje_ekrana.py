@@ -7,11 +7,15 @@ from datetime import datetime
 import base64
 import ctypes
 from ctypes import wintypes
+import hashlib
 import re
 import subprocess
 import os
 import socket
 import sys
+import threading
+import webbrowser
+import zipfile
 
 APP_DIR = (
     Path(sys.executable).resolve().parent
@@ -23,6 +27,23 @@ SCRCPY_EXE = APP_DIR / "scrcpy" / "scrcpy.exe"
 ADB_SERVER_PORT = 5038
 # U --windowed exe verziji svaki konzolni program bi otvorio crni prozor.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# Folderi na telefonu u kojima završe exporti chatova: WhatsApp dokumenti
+# (kad se export pošalje sebi) i Download/Documents (kad se sačuva u Files).
+WHATSAPP_FOLDERI = [
+    "/sdcard/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Documents",
+    "/sdcard/Android/media/com.whatsapp.w4b/WhatsApp Business/Media/"
+    "WhatsApp Business Documents",
+    "/sdcard/WhatsApp/Media/WhatsApp Documents",
+    # Drugi WhatsApp: Xiaomi "Dual apps" (korisnik 999),
+    # Samsung "Dual Messenger" (korisnik 95).
+    "/storage/emulated/999/Android/media/com.whatsapp/WhatsApp/Media/"
+    "WhatsApp Documents",
+    "/storage/emulated/999/WhatsApp/Media/WhatsApp Documents",
+    "/storage/emulated/95/Android/media/com.whatsapp/WhatsApp/Media/"
+    "WhatsApp Documents",
+    "/sdcard/Download",
+    "/sdcard/Documents",
+]
 
 folder = Path.home() / "Pictures" / "SNIMCI"
 folder.mkdir(parents=True, exist_ok=True)
@@ -52,6 +73,7 @@ kamera_video_putanja = None
 automatski_screenshot_aktivan = False
 automatski_screenshot_job = None
 adb_status_job = None
+info_telefona_job = None
 boje_dugmadi = {
     "pokreni": ("#1769D2", "white"),
     "video": ("#D9485F", "white"),
@@ -192,6 +214,23 @@ def osvjezi_adb_status():
         server_status = f"neaktivan na portu {ADB_SERVER_PORT}"
     adb_status.set(f"ADB {adb_verzija_localna}: server {server_status}")
     adb_status_job = app.after(2000, osvjezi_adb_status)
+
+def osvjezi_info_telefona():
+    global info_telefona_job
+    try:
+        uredjaji = adb_poziv(["devices"], timeout=5).decode(errors="replace")
+        serijski = [
+            red.split("\t")[0] for red in uredjaji.splitlines()[1:]
+            if "\tdevice" in red
+        ]
+        if not serijski:
+            info_telefona.set("Telefon: nije spojen / nije prepoznat")
+        else:
+            model = adb_getprop("ro.product.model", timeout=5) or "nepoznat model"
+            info_telefona.set(f"Telefon: {model}  ·  Serijski broj: {serijski[0]}")
+    except RuntimeError:
+        info_telefona.set("Telefon: ne mogu se spojiti (provjeri USB/ADB)")
+    info_telefona_job = app.after(3000, osvjezi_info_telefona)
 
 def adb_server_aktivan():
     try:
@@ -823,6 +862,16 @@ def adb_poziv(argumenti, timeout=20):
         greska = rezultat.stderr.decode(errors="replace").strip()
         raise RuntimeError(greska or "ADB naredba nije uspjela.")
     return rezultat.stdout
+
+def adb_getprop(ime, timeout=10):
+    # Vraća "" ako property ne postoji na ovom modelu/firmware-u — ne baca
+    # grešku, jer dobar dio ovih property-ja zavisi od proizvođača.
+    try:
+        return adb_poziv(["shell", "getprop", ime], timeout=timeout).decode(
+            errors="replace"
+        ).strip()
+    except RuntimeError:
+        return ""
 
 def paket_u_prednjem_planu():
     izlazi = [
@@ -1586,6 +1635,886 @@ def zaustavi_kameru():
 def otvori_folder():
     os.startfile(folder)
 
+def pronadji_whatsapp_exporte(dodatni_folder=None, sve=False):
+    # Kad se export pošalje sebi, WhatsApp zip preimenuje u
+    # "DOC-20261028-WA0001.zip", pa se zip prepoznaje po sadržaju:
+    # unutra mora biti .txt sa "WhatsApp" u imenu (radi na svakom jeziku:
+    # "WhatsApp Chat with...", "WhatsApp Chat mit...", "Chat de WhatsApp...").
+    # sve=True prikazuje i ostale .zip/.txt fajlove.
+    folderi = WHATSAPP_FOLDERI + ([dodatni_folder] if dodatni_folder else [])
+    folderi = " ".join("'" + f.replace("'", "'\\''") + "'" for f in folderi)
+    skripta = (
+        f"SVE={1 if sve else 0}; "
+        f"find {folderi} -type f \\( -iname '*.zip' -o -iname '*.txt' \\) "
+        "2>/dev/null | while IFS= read -r f; do "
+        "case \"$f\" in "
+        "*.zip|*.ZIP) ime=$(unzip -l \"$f\" 2>/dev/null "
+        "| sed -nE 's/^ *[0-9]+ +[0-9-]+ +[0-9:]+ +//p' "
+        "| grep -i 'whatsapp.*\\.txt$' | head -n 1) ;; "
+        "*) ime=$(echo \"${f##*/}\" | grep -i 'whatsapp') ;; "
+        "esac; "
+        "[ -z \"$ime\" ] && [ \"$SVE\" = 1 ] && ime=${f##*/}; "
+        "[ -n \"$ime\" ] && echo \"$(stat -c '%Y|%s' \"$f\")|$f|${ime##*/}\"; "
+        "done; true"
+    )
+    izlaz = adb_poziv(["shell", skripta], timeout=180)
+    fajlovi = {}
+    for red in izlaz.decode("utf-8", errors="replace").splitlines():
+        dijelovi = red.strip().split("|")
+        if len(dijelovi) < 4 or not (dijelovi[0].isdigit() and dijelovi[1].isdigit()):
+            continue
+        putanja = "|".join(dijelovi[2:-1])
+        roditelj = putanja.rsplit("/", 2)[-2] if putanja.count("/") >= 1 else ""
+        # Raspakovane kopije zip-a (folder "DOC-...-WA0001" ili "... (1)")
+        # se preskaču; original je zip pored njih.
+        if not putanja.lower().endswith(".zip") and re.fullmatch(
+            r"DOC-\d{8}-WA\d+( \(\d+\))?", roditelj
+        ):
+            continue
+        fajlovi[putanja] = (
+            int(dijelovi[0]), int(dijelovi[1]), putanja, dijelovi[-1]
+        )
+    # Najnoviji prvi.
+    return sorted(fajlovi.values(), reverse=True)
+
+def lokalno_ime_exporta(putanja, ime_chata):
+    # "DOC-...zip" s chatom "WhatsApp Chat with Ana.txt" →
+    # "WhatsApp Chat with Ana.zip".
+    if putanja.lower().endswith(".zip"):
+        ime = ime_chata.rsplit(".", 1)[0] + ".zip"
+    else:
+        ime = putanja.rsplit("/", 1)[-1]
+    return re.sub(r'[<>:"/\\|?*]', "_", ime)
+
+def kopiraj_whatsapp_exporte(stavke, odrediste, rezultati):
+    # Radi u posebnoj niti: ne dira Tk, samo puni listu rezultata.
+    for putanja, ime in stavke:
+        privremeni = odrediste / f".preuzimanje_{putanja.rsplit('/', 1)[-1]}"
+        try:
+            adb_poziv(["pull", "-a", putanja, str(privremeni)], timeout=1800)
+            if privremeni.suffix.lower() == ".zip":
+                # Ime chata iz zip-a čita Python: unzip na telefonu
+                # zna pokvariti naša slova (č, ć, ž...).
+                with zipfile.ZipFile(privremeni) as arhiva:
+                    chat = next(
+                        (n for n in arhiva.namelist()
+                         if "whatsapp" in n.lower() and n.lower().endswith(".txt")),
+                        None
+                    )
+                if chat:
+                    ime = lokalno_ime_exporta(putanja, chat.rsplit("/", 1)[-1])
+            cilj = odrediste / ime
+            broj = 1
+            while cilj.exists():
+                cilj = odrediste / f"{Path(ime).stem}_{broj}{Path(ime).suffix}"
+                broj += 1
+            privremeni.rename(cilj)
+            with cilj.open("rb") as fajl:
+                sha = hashlib.sha256()
+                for blok in iter(lambda: fajl.read(1024 * 1024), b""):
+                    sha.update(blok)
+            rezultati.append((putanja, cilj, sha.hexdigest(), None))
+        except (RuntimeError, OSError, zipfile.BadZipFile) as e:
+            privremeni.unlink(missing_ok=True)
+            rezultati.append((putanja, None, None, str(e)))
+
+def whatsapp_eksport():
+    prozor = tk.Toplevel(app)
+    prozor.title("WhatsApp eksport chata")
+    prozor.configure(bg="#EAF2FB")
+    prozor.resizable(False, False)
+    prozor.transient(app)
+
+    tk.Label(
+        prozor,
+        text="Eksport WhatsApp chata na računar",
+        bg="#EAF2FB",
+        fg="#174A7E",
+        font=("Segoe UI", 11, "bold")
+    ).pack(anchor="w", padx=16, pady=(14, 6))
+    koraci = (
+        "Na telefonu (WhatsApp na engleskom):\n\n"
+        "1.  Otvori chat koji želiš sačuvati.\n"
+        "2.  Gore desno klikni  ⋮  →  More  →  Export chat.\n"
+        "3.  Izaberi  Without media  (samo tekst) ili\n"
+        "      Include media  (sa slikama i glasovnim porukama).\n"
+        "4.  U listi za dijeljenje izaberi  WhatsApp.\n"
+        "5.  Za primaoca izaberi sebe  —  (You)  /  Message yourself\n"
+        "      →  Send.\n"
+        "      (Ako u listi imaš  Files:  Files  →  Download  →  Save.)\n"
+        "6.  Ponovi za ostale chatove koje želiš.\n\n"
+        "Kad završiš, telefon ostavi spojen i klikni\n"
+        "„Uradio sam — pronađi fajlove”."
+    )
+    tk.Label(
+        prozor,
+        text=koraci,
+        bg="#FFFFFF",
+        fg="#243B53",
+        justify="left",
+        anchor="w",
+        font=("Segoe UI", 10),
+        padx=12,
+        pady=10
+    ).pack(fill="x", padx=16, pady=(0, 10))
+
+    dodatni_folder = tk.StringVar()
+    prikazi_sve = tk.BooleanVar(value=False)
+    opcije = tk.LabelFrame(
+        prozor,
+        text=" Ako export nije pronađen (drugi telefon, drugi folder) ",
+        bg="#EAF2FB",
+        fg="#38536D",
+        font=("Segoe UI", 9),
+        padx=8,
+        pady=6
+    )
+    opcije.pack(fill="x", padx=16, pady=(0, 8))
+    red_foldera = tk.Frame(opcije, bg="#EAF2FB")
+    red_foldera.pack(fill="x")
+    tk.Label(
+        red_foldera, text="Dodatni folder na telefonu:",
+        bg="#EAF2FB", fg="#243B53", font=("Segoe UI", 9)
+    ).pack(side="left")
+    tk.Entry(
+        red_foldera, textvariable=dodatni_folder,
+        font=("Consolas", 9), relief="solid", bd=1
+    ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+    tk.Label(
+        opcije,
+        text="npr. /sdcard/Download/WhatsApp  ·  /sdcard = cijeli telefon "
+             "(sporije)  ·  prazno = standardne lokacije",
+        bg="#EAF2FB", fg="#6B7C8F", font=("Segoe UI", 8)
+    ).pack(anchor="w", pady=(2, 2))
+    tk.Checkbutton(
+        opcije,
+        text="Prikaži sve .zip/.txt fajlove (ne samo WhatsApp exporte)",
+        variable=prikazi_sve,
+        bg="#EAF2FB", activebackground="#EAF2FB", font=("Segoe UI", 9)
+    ).pack(anchor="w")
+
+    info = tk.StringVar(value="Pronađeni fajlovi će se pojaviti ovdje.")
+    tk.Label(
+        prozor,
+        textvariable=info,
+        bg="#EAF2FB",
+        fg="#38536D",
+        wraplength=460,
+        justify="left",
+        font=("Segoe UI", 9)
+    ).pack(anchor="w", padx=16, pady=(0, 4))
+
+    lista_okvir = tk.Frame(prozor, bg="#FFFFFF")
+    lista_okvir.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+    klizac = tk.Scrollbar(lista_okvir)
+    klizac.pack(side="right", fill="y")
+    lista = tk.Listbox(
+        lista_okvir,
+        height=7,
+        width=70,
+        selectmode="extended",
+        bg="#FFFFFF",
+        fg="#243B53",
+        selectbackground="#1769D2",
+        selectforeground="white",
+        yscrollcommand=klizac.set,
+        relief="flat",
+        font=("Consolas", 9)
+    )
+    lista.pack(side="left", fill="both", expand=True)
+    klizac.config(command=lista.yview)
+
+    pronadjeni = []
+
+    def pretrazi():
+        dodatni = dodatni_folder.get().strip().rstrip("/")
+        if dodatni and not dodatni.startswith("/"):
+            messagebox.showwarning(
+                "Neispravan folder",
+                "Folder na telefonu mora počinjati sa /, npr. /sdcard/Download",
+                parent=prozor
+            )
+            return
+        if not proveri_telefon():
+            return
+        info.set("Tražim fajlove na telefonu...")
+        prozor.update_idletasks()
+        try:
+            fajlovi = pronadji_whatsapp_exporte(dodatni or None, prikazi_sve.get())
+        except RuntimeError as e:
+            info.set("Pretraga nije uspjela.")
+            messagebox.showerror("Greška", str(e), parent=prozor)
+            return
+        pronadjeni[:] = fajlovi
+        lista.delete(0, "end")
+        if not fajlovi:
+            info.set(
+                "Nije pronađen nijedan export. Provjeri da li je Send završen. "
+                "Ako je export negdje drugdje, upiši folder iznad ili uključi "
+                "„Prikaži sve .zip/.txt fajlove”."
+            )
+            kopiraj_dugme.config(state="disabled")
+            return
+        granica = datetime.now().timestamp() - 30 * 60
+        for vrijeme, velicina, putanja, ime_chata in fajlovi:
+            naziv_fajla = putanja.rsplit("/", 1)[-1]
+            opis = ime_chata.rsplit(".", 1)[0]
+            if naziv_fajla.lower().endswith(".zip"):
+                opis += f"  (zip, {naziv_fajla})"
+            else:
+                opis += "  (txt)"
+            lista.insert(
+                "end",
+                f"{datetime.fromtimestamp(vrijeme):%d.%m.%Y %H:%M}  "
+                f"{velicina / 1024:>9.0f} KB  {opis}"
+            )
+        # Unaprijed označi exporte iz zadnjih 30 minuta (ili najnoviji).
+        novi = [i for i, f in enumerate(fajlovi) if f[0] >= granica] or [0]
+        for i in novi:
+            lista.selection_set(i)
+        info.set(
+            f"Pronađeno fajlova: {len(fajlovi)}. Označeni su najnoviji; "
+            "Ctrl/Shift + klik za drugačiji izbor."
+        )
+        kopiraj_dugme.config(state="normal")
+        zabiljezi(f"WhatsApp eksport: pronađeno {len(fajlovi)} fajlova na telefonu.")
+
+    def kopiraj():
+        izbori = lista.curselection()
+        if not izbori:
+            messagebox.showwarning(
+                "Ništa nije izabrano", "Izaberi bar jedan fajl.", parent=prozor
+            )
+            return
+        odrediste = folder / "WHATSAPP_EXPORT"
+        try:
+            odrediste.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror("Greška", str(e), parent=prozor)
+            return
+        stavke = [
+            (pronadjeni[i][2], lokalno_ime_exporta(pronadjeni[i][2], pronadjeni[i][3]))
+            for i in izbori
+        ]
+        putanje = [putanja for putanja, _ime in stavke]
+        rezultati = []
+        nit = threading.Thread(
+            target=kopiraj_whatsapp_exporte,
+            args=(stavke, odrediste, rezultati),
+            daemon=True
+        )
+        for dugme in (trazi_dugme, kopiraj_dugme):
+            dugme.config(state="disabled")
+        info.set(f"Kopiram {len(putanje)} fajl(ova) na računar...")
+        nit.start()
+
+        def provjeri_kraj():
+            if nit.is_alive():
+                info.set(
+                    f"Kopiram... {len(rezultati)} od {len(putanje)} završeno"
+                )
+                app.after(300, provjeri_kraj)
+                return
+            uspjesni = [r for r in rezultati if r[3] is None]
+            for putanja, cilj, sha, greska in rezultati:
+                if greska:
+                    zabiljezi(f"WhatsApp eksport — greška za {putanja}: {greska}")
+                else:
+                    zabiljezi(f"WhatsApp eksport kopiran: {cilj} (SHA-256 {sha})")
+            if not prozor.winfo_exists():
+                return
+            for dugme in (trazi_dugme, kopiraj_dugme):
+                dugme.config(state="normal")
+            info.set(
+                f"Kopirano {len(uspjesni)} od {len(putanje)} u {odrediste}"
+            )
+            status.set(f"WhatsApp eksport: kopirano {len(uspjesni)} fajl(ova)")
+            greske = [r for r in rezultati if r[3]]
+            poruka = f"Kopirano {len(uspjesni)} fajl(ova) u:\n{odrediste}"
+            if greske:
+                poruka += f"\n\nNije uspjelo: {len(greske)} (detalji u logu sesije)."
+            if uspjesni and messagebox.askyesno(
+                "Kopiranje završeno",
+                poruka + "\n\nOtvoriti folder?",
+                parent=prozor
+            ):
+                os.startfile(odrediste)
+            elif not uspjesni:
+                messagebox.showerror("Kopiranje nije uspjelo", poruka, parent=prozor)
+
+        app.after(300, provjeri_kraj)
+
+    dugmad_prozora = tk.Frame(prozor, bg="#EAF2FB")
+    dugmad_prozora.pack(fill="x", padx=12, pady=(0, 12))
+    trazi_dugme = tk.Button(
+        dugmad_prozora,
+        text="Uradio sam — pronađi fajlove",
+        command=pretrazi,
+        bg="#1769D2",
+        fg="white",
+        activebackground="#1456A0",
+        activeforeground="white",
+        relief="flat",
+        padx=12,
+        pady=7
+    )
+    trazi_dugme.pack(side="left", padx=4)
+    kopiraj_dugme = tk.Button(
+        dugmad_prozora,
+        text="Kopiraj izabrane na računar",
+        command=kopiraj,
+        state="disabled",
+        bg="#2E7D32",
+        fg="white",
+        activebackground="#1B5E20",
+        activeforeground="white",
+        relief="flat",
+        padx=12,
+        pady=7
+    )
+    kopiraj_dugme.pack(side="left", padx=4)
+    tk.Button(
+        dugmad_prozora,
+        text="Zatvori",
+        command=prozor.destroy,
+        bg="#D8E8FA",
+        fg="#174A7E",
+        relief="flat",
+        padx=12,
+        pady=7
+    ).pack(side="right", padx=4)
+
+    prozor.bind("<Escape>", lambda _event: prozor.destroy())
+    centriraj_prozor(prozor, app)
+
+ROOT_KORACI = (
+    "Identifikacija telefona",
+    "Firmware",
+    "Opcije za programere",
+    "Otključavanje bootloadera",
+    "Magisk patch",
+    "Odin flash",
+    "Provjera roota",
+    "Rezime",
+)
+
+def root_eksport():
+    prozor = tk.Toplevel(app)
+    prozor.title("ROOT eksport — hodogram rootovanja")
+    prozor.configure(bg="#EAF2FB")
+    prozor.resizable(False, False)
+    prozor.transient(app)
+
+    tk.Label(
+        prozor,
+        text="ROOT eksport — hodogram rootovanja Samsung telefona",
+        bg="#EAF2FB",
+        fg="#174A7E",
+        font=("Segoe UI", 11, "bold")
+    ).pack(anchor="w", padx=16, pady=(14, 4))
+    koraci_oznaka = tk.StringVar()
+    tk.Label(
+        prozor,
+        textvariable=koraci_oznaka,
+        bg="#EAF2FB",
+        fg="#38536D",
+        font=("Segoe UI", 9, "bold")
+    ).pack(anchor="w", padx=16, pady=(0, 8))
+
+    podaci = {
+        "model": tk.StringVar(),
+        "pda": tk.StringVar(),
+        "csc": tk.StringVar(),
+        "android": tk.StringVar(),
+        "serijski": tk.StringVar(),
+        "knox_pocetno": tk.StringVar(value="nepoznato"),
+        "bootloader_pocetno": tk.StringVar(value="nepoznato"),
+        "bootloader_sada": tk.StringVar(value="nije provjereno"),
+        "oem_status": tk.StringVar(value="nije provjereno"),
+        "ap_fajl": tk.StringVar(),
+        "patch_fajl": tk.StringVar(),
+        "firmware_preuzet": tk.BooleanVar(value=False),
+        "dev_opcije": tk.BooleanVar(value=False),
+        "bootloader_otkljucan": tk.BooleanVar(value=False),
+        "magisk_patch": tk.BooleanVar(value=False),
+        "odin_flash": tk.BooleanVar(value=False),
+        "root_status": tk.StringVar(value="nije provjereno"),
+    }
+
+    sadrzaj = tk.Frame(prozor, bg="#FFFFFF")
+    sadrzaj.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+
+    def naslov_koraka(roditelj, tekst):
+        tk.Label(
+            roditelj, text=tekst, bg="#FFFFFF", fg="#51677F",
+            font=("Segoe UI", 9, "bold")
+        ).pack(anchor="w", pady=(0, 6))
+
+    def uputstvo(roditelj, tekst):
+        tk.Label(
+            roditelj, text=tekst, bg="#FFFFFF", fg="#243B53",
+            justify="left", anchor="w", wraplength=460, font=("Segoe UI", 9)
+        ).pack(anchor="w", pady=(0, 8))
+
+    def red_polja(roditelj, oznaka, var, sirina=30):
+        red = tk.Frame(roditelj, bg="#FFFFFF")
+        red.pack(fill="x", pady=2)
+        tk.Label(
+            red, text=oznaka, bg="#FFFFFF", fg="#243B53", width=22,
+            anchor="w", font=("Segoe UI", 9)
+        ).pack(side="left")
+        tk.Entry(
+            red, textvariable=var, font=("Consolas", 9), relief="solid", bd=1,
+            width=sirina
+        ).pack(side="left", fill="x", expand=True)
+
+    # --- Korak 1: identifikacija ---
+    k1 = tk.Frame(sadrzaj, bg="#FFFFFF", padx=16, pady=14)
+    naslov_koraka(k1, "1. KORAK  ·  IDENTIFIKACIJA TELEFONA")
+    uputstvo(
+        k1,
+        "Klikni „Pročitaj sa telefona” da automatski popuniš podatke, ili "
+        "ih upiši ručno iz Settings → About phone → Software information."
+    )
+    red_polja(k1, "Model:", podaci["model"])
+    red_polja(k1, "Build number / PDA:", podaci["pda"])
+    red_polja(k1, "CSC kod (regija):", podaci["csc"])
+    red_polja(k1, "Android verzija:", podaci["android"])
+    red_polja(k1, "Serijski broj:", podaci["serijski"])
+    status_k1 = tk.StringVar(value="Knox / bootloader status: nepoznato")
+    tk.Label(
+        k1, textvariable=status_k1, bg="#FFFFFF", fg="#795800",
+        font=("Segoe UI", 9), wraplength=460, justify="left"
+    ).pack(anchor="w", pady=(8, 0))
+
+    def ucitaj_identifikaciju():
+        if not proveri_telefon():
+            return
+        podaci["model"].set(adb_getprop("ro.product.model") or podaci["model"].get())
+        podaci["pda"].set(adb_getprop("ro.build.display.id") or podaci["pda"].get())
+        podaci["csc"].set(adb_getprop("ro.csc.sales_code") or podaci["csc"].get())
+        podaci["android"].set(
+            adb_getprop("ro.build.version.release") or podaci["android"].get()
+        )
+        podaci["serijski"].set(adb_getprop("ro.serialno") or podaci["serijski"].get())
+        knox = adb_getprop("ro.boot.warranty_bit")
+        zakljucan = adb_getprop("ro.boot.flash.locked")
+        podaci["knox_pocetno"].set(knox or "nepoznato")
+        podaci["bootloader_pocetno"].set(zakljucan or "nepoznato")
+        status_k1.set(
+            "Knox warranty bit: " + (
+                {"0": "0 (nije tripovan)", "1": "1 (već tripovan — "
+                 "neki prethodni korak je već izveden)"}.get(knox, "nepoznato")
+            ) + "\nBootloader: " + (
+                {"0": "otključan", "1": "zaključan"}.get(zakljucan, "nepoznato")
+            )
+        )
+        zabiljezi(
+            f"ROOT eksport: pročitani podaci telefona "
+            f"({podaci['model'].get()}, CSC {podaci['csc'].get()})."
+        )
+
+    tk.Button(
+        k1, text="Pročitaj sa telefona", command=ucitaj_identifikaciju,
+        bg="#1769D2", fg="white", relief="flat", padx=12, pady=6
+    ).pack(anchor="w", pady=(10, 0))
+
+    # --- Korak 2: firmware ---
+    k2 = tk.Frame(sadrzaj, bg="#FFFFFF", padx=16, pady=14)
+    naslov_koraka(k2, "2. KORAK  ·  FIRMWARE")
+    uputstvo(
+        k2,
+        "Na sajtu za preuzimanje firmware-a unesi tačno ova dva podatka "
+        "(iz 1. koraka):"
+    )
+    podaci_oznaka = tk.StringVar()
+    tk.Label(
+        k2, textvariable=podaci_oznaka, bg="#F4F8FC", fg="#174A7E",
+        font=("Consolas", 10, "bold"), justify="left", anchor="w",
+        padx=10, pady=8, relief="solid", bd=1
+    ).pack(fill="x", pady=(0, 8))
+
+    def osvjezi_podatke_oznaku():
+        model = podaci["model"].get() or "(nije pročitano — vrati se na 1. korak)"
+        csc = podaci["csc"].get() or "(nije pročitano — vrati se na 1. korak)"
+        podaci_oznaka.set(f"Model:    {model}\nCSC kod:  {csc}")
+
+    link_status = tk.StringVar()
+
+    def otvori_samfw():
+        model = podaci["model"].get().strip()
+        csc = podaci["csc"].get().strip()
+        if not model or not csc:
+            messagebox.showwarning(
+                "Nedostaju podaci",
+                "Prvo se vrati na 1. korak i pročitaj podatke sa telefona "
+                "(ili ih upiši ručno).",
+                parent=prozor
+            )
+            return
+        webbrowser.open(f"https://samfw.com/firmware/{model}/{csc}")
+        link_status.set(
+            "Otvoreno u pretraživaču. Napomena: link nije softverski "
+            "provjeren (SamFw blokira automatske provjere) — ako stranica "
+            "ne prikaže firmware, na sajtu ručno pretraži model i CSC kod "
+            "iz polja iznad, ili koristi alat Frija."
+        )
+
+    tk.Button(
+        k2, text="Otvori SamFw za ovaj model i CSC kod →",
+        command=otvori_samfw,
+        bg="#1769D2", fg="white", relief="flat", padx=12, pady=7
+    ).pack(anchor="w", pady=(0, 6))
+    tk.Label(
+        k2, textvariable=link_status, bg="#FFFFFF", fg="#795800",
+        wraplength=460, justify="left", font=("Segoe UI", 8)
+    ).pack(anchor="w", pady=(0, 10))
+
+    uputstvo(
+        k2,
+        "Paket sadrži AP, BL, CP i CSC/HOME_CSC fajlove — za patch treba "
+        "samo AP."
+    )
+    red_polja(k2, "Naziv AP fajla:", podaci["ap_fajl"])
+    tk.Checkbutton(
+        k2, text="Preuzeo sam odgovarajući firmware",
+        variable=podaci["firmware_preuzet"], bg="#FFFFFF", font=("Segoe UI", 9)
+    ).pack(anchor="w", pady=(10, 0))
+
+    # --- Korak 3: opcije za programere ---
+    k3 = tk.Frame(sadrzaj, bg="#FFFFFF", padx=16, pady=14)
+    naslov_koraka(k3, "3. KORAK  ·  OPCIJE ZA PROGRAMERE")
+    uputstvo(
+        k3,
+        "Settings → About phone → Software information → tapni 7× na Build "
+        "number. Zatim Settings → Developer options → uključi "
+        "„OEM unlocking” i „USB debugging”."
+    )
+    oem_oznaka = tk.StringVar(value="OEM unlocking: nije provjereno")
+    tk.Label(
+        k3, textvariable=oem_oznaka, bg="#FFFFFF", fg="#795800",
+        font=("Segoe UI", 9)
+    ).pack(anchor="w", pady=(4, 0))
+
+    def provjeri_oem():
+        if not proveri_telefon():
+            return
+        vrijednost = adb_getprop("sys.oem_unlock_allowed")
+        podaci["oem_status"].set(
+            {"1": "uključeno", "0": "isključeno"}.get(vrijednost, "nepoznato")
+        )
+        oem_oznaka.set(f"OEM unlocking: {podaci['oem_status'].get()}")
+
+    tk.Button(
+        k3, text="Provjeri sa telefona", command=provjeri_oem,
+        bg="#1769D2", fg="white", relief="flat", padx=12, pady=6
+    ).pack(anchor="w", pady=(6, 0))
+    tk.Checkbutton(
+        k3, text="Uradio sam ovaj korak", variable=podaci["dev_opcije"],
+        bg="#FFFFFF", font=("Segoe UI", 9)
+    ).pack(anchor="w", pady=(10, 0))
+
+    # --- Korak 4: otključavanje bootloadera ---
+    k4 = tk.Frame(sadrzaj, bg="#FFFFFF", padx=16, pady=14)
+    naslov_koraka(k4, "4. KORAK  ·  OTKLJUČAVANJE BOOTLOADERA (DOWNLOAD MODE)")
+    uputstvo(
+        k4,
+        "Isključi telefon. Pritisni i zadrži Volume Up + Volume Down, pa "
+        "prikopčaj USB. Volume Up za nastavak u Download Mode, pa ponovo "
+        "Volume Up da potvrdiš otključavanje.\n\n"
+        "⚠️ Ovo radi factory reset — briše internu memoriju. Knox "
+        "warranty bit se trajno postavlja na 1 i to se ne vraća."
+    )
+    bootloader_oznaka = tk.StringVar(value="Bootloader sada: nije provjereno")
+    tk.Label(
+        k4, textvariable=bootloader_oznaka, bg="#FFFFFF", fg="#795800",
+        font=("Segoe UI", 9), wraplength=460, justify="left"
+    ).pack(anchor="w", pady=(4, 0))
+
+    def provjeri_bootloader():
+        if not proveri_telefon():
+            return
+        sada = adb_getprop("ro.boot.flash.locked")
+        podaci["bootloader_sada"].set(sada or "nepoznato")
+        opis = {"0": "otključan", "1": "zaključan"}.get(sada, "nepoznato")
+        prije = podaci["bootloader_pocetno"].get()
+        promjena = (
+            "  (promijenjeno od 1. koraka)"
+            if sada and prije not in ("nepoznato", sada) else ""
+        )
+        bootloader_oznaka.set(f"Bootloader sada: {opis}{promjena}")
+
+    tk.Button(
+        k4, text="Provjeri status sa telefona", command=provjeri_bootloader,
+        bg="#1769D2", fg="white", relief="flat", padx=12, pady=6
+    ).pack(anchor="w", pady=(6, 0))
+    tk.Checkbutton(
+        k4, text="Uradio sam ovaj korak", variable=podaci["bootloader_otkljucan"],
+        bg="#FFFFFF", font=("Segoe UI", 9)
+    ).pack(anchor="w", pady=(10, 0))
+
+    # --- Korak 5: Magisk patch ---
+    k5 = tk.Frame(sadrzaj, bg="#FFFFFF", padx=16, pady=14)
+    naslov_koraka(k5, "5. KORAK  ·  MAGISK PATCH")
+    uputstvo(
+        k5,
+        "Izaberi Magisk APK sa računara i prebaci ga na telefon, pa ga "
+        "instaliraj kroz Files aplikaciju na telefonu. Zatim prebaci AP "
+        "fajl na telefon (adb push ... /sdcard/Download/). U Magisk app: "
+        "Install → Select and Patch a File → izaberi AP fajl."
+    )
+
+    magisk_status = tk.StringVar()
+    magisk_status_boja = tk.StringVar(value="#174A7E")
+    ap_status = tk.StringVar()
+    ap_status_boja = tk.StringVar(value="#174A7E")
+
+    def posalji_fajl_na_telefon(naslov_dijaloga, status_var, boja_var, poruka_uspjeh):
+        putanja = filedialog.askopenfilename(
+            title=naslov_dijaloga,
+            filetypes=[("APK/TAR fajlovi", "*.apk;*.tar;*.tar.md5"), ("Svi fajlovi", "*.*")],
+            parent=prozor
+        )
+        if not putanja:
+            return
+        naziv = Path(putanja).name
+        boja_var.set("#174A7E")
+        status_var.set(f"Prebacujem {naziv} na telefon...")
+        prozor.update_idletasks()
+        try:
+            adb_poziv(["push", putanja, "/sdcard/Download/"], timeout=120)
+            boja_var.set("#1E7B34")
+            status_var.set(f"✓ Prebačeno: /sdcard/Download/{naziv}\n{poruka_uspjeh}")
+        except RuntimeError as e:
+            boja_var.set("#B3261E")
+            status_var.set(f"✗ Greška kod prebacivanja: {e}")
+
+    tk.Button(
+        k5, text="Izaberi Magisk APK i pošalji na telefon →",
+        command=lambda: posalji_fajl_na_telefon(
+            "Izaberi Magisk APK", magisk_status, magisk_status_boja,
+            "Otvori Files aplikaciju na telefonu → Download → tapni na fajl "
+            "da ga instaliraš (dozvoli 'Install unknown apps' ako se to "
+            "pojavi)."
+        ),
+        bg="#1769D2", fg="white", relief="flat", padx=12, pady=7
+    ).pack(anchor="w", pady=(0, 6))
+    oznaka_magisk = tk.Label(
+        k5, textvariable=magisk_status, bg="#FFFFFF", fg=magisk_status_boja.get(),
+        wraplength=460, justify="left", font=("Segoe UI", 8)
+    )
+    oznaka_magisk.pack(anchor="w", pady=(0, 10))
+    magisk_status_boja.trace_add(
+        "write", lambda *a: oznaka_magisk.config(fg=magisk_status_boja.get())
+    )
+
+    tk.Button(
+        k5, text="Izaberi AP fajl i pošalji na telefon →",
+        command=lambda: posalji_fajl_na_telefon(
+            "Izaberi AP fajl (tar / tar.md5)", ap_status, ap_status_boja,
+            "Sada u Magisk app: Install → Select and Patch a File → izaberi "
+            "ovaj fajl u Download folderu."
+        ),
+        bg="#1769D2", fg="white", relief="flat", padx=12, pady=7
+    ).pack(anchor="w", pady=(0, 6))
+    oznaka_ap = tk.Label(
+        k5, textvariable=ap_status, bg="#FFFFFF", fg=ap_status_boja.get(),
+        wraplength=460, justify="left", font=("Segoe UI", 8)
+    )
+    oznaka_ap.pack(anchor="w", pady=(0, 10))
+    ap_status_boja.trace_add(
+        "write", lambda *a: oznaka_ap.config(fg=ap_status_boja.get())
+    )
+
+    red_polja(k5, "Naziv patchovanog fajla:", podaci["patch_fajl"])
+    tk.Checkbutton(
+        k5, text="Uradio sam ovaj korak", variable=podaci["magisk_patch"],
+        bg="#FFFFFF", font=("Segoe UI", 9)
+    ).pack(anchor="w", pady=(10, 0))
+
+    # --- Korak 6: Odin flash ---
+    k6 = tk.Frame(sadrzaj, bg="#FFFFFF", padx=16, pady=14)
+    naslov_koraka(k6, "6. KORAK  ·  ODIN FLASH")
+    uputstvo(
+        k6,
+        "Ponovo uđi u Download Mode. U Odinu klikni AP i izaberi "
+        "patchovani fajl (BL/CP/CSC ostaju prazni). U Options neka budu "
+        "uključeni samo Auto Reboot i F. Reset Time. Start → sačekaj PASS."
+    )
+    tk.Checkbutton(
+        k6, text="Uradio sam ovaj korak", variable=podaci["odin_flash"],
+        bg="#FFFFFF", font=("Segoe UI", 9)
+    ).pack(anchor="w", pady=(10, 0))
+
+    # --- Korak 7: provjera roota ---
+    k7 = tk.Frame(sadrzaj, bg="#FFFFFF", padx=16, pady=14)
+    naslov_koraka(k7, "7. KORAK  ·  PROVJERA ROOTA")
+    uputstvo(
+        k7,
+        "Nakon restarta telefona klikni dugme ispod da provjerimo root "
+        "preko ADB-a. Isto možeš provjeriti i u Magisk app."
+    )
+    root_oznaka = tk.StringVar(value="Status: nije provjereno")
+    tk.Label(
+        k7, textvariable=root_oznaka, bg="#FFFFFF", fg="#795800",
+        font=("Segoe UI", 9, "bold")
+    ).pack(anchor="w", pady=(4, 0))
+
+    def provjeri_root():
+        if not proveri_telefon():
+            return
+        try:
+            izlaz = adb_poziv(["shell", "su", "-c", "id"], timeout=15).decode(
+                errors="replace"
+            )
+        except RuntimeError as e:
+            podaci["root_status"].set(f"neuspješno ({e})")
+            root_oznaka.set(f"Status: {podaci['root_status'].get()}")
+            return
+        if "uid=0" in izlaz:
+            podaci["root_status"].set("uspješno — telefon je rootovan")
+        else:
+            podaci["root_status"].set(f"neuspješno (odgovor: {izlaz.strip()})")
+        root_oznaka.set(f"Status: {podaci['root_status'].get()}")
+        zabiljezi(f"ROOT eksport: provjera roota — {podaci['root_status'].get()}")
+
+    tk.Button(
+        k7, text="Provjeri root sa telefona", command=provjeri_root,
+        bg="#1769D2", fg="white", relief="flat", padx=12, pady=6
+    ).pack(anchor="w", pady=(6, 0))
+
+    # --- Korak 8: rezime ---
+    k8 = tk.Frame(sadrzaj, bg="#FFFFFF", padx=16, pady=14)
+    naslov_koraka(k8, "8. KORAK  ·  REZIME")
+    uputstvo(k8, "Provjeri rezime i sačuvaj ga kao TXT fajl na računar.")
+    rezime_tekst = tk.Text(
+        k8, height=14, width=58, wrap="word", bg="#F4F8FC", fg="#243B53",
+        font=("Consolas", 9), relief="solid", bd=1
+    )
+    rezime_tekst.pack(fill="both", expand=True, pady=(4, 8))
+
+    def da_ne(vrijednost):
+        return "DA" if vrijednost else "NE"
+
+    def sastavi_rezime():
+        redovi = [
+            f"ROOT hodogram — {datetime.now():%d.%m.%Y %H:%M:%S}",
+            "=" * 50,
+            "",
+            "1. IDENTIFIKACIJA TELEFONA",
+            f"   Model: {podaci['model'].get() or '-'}",
+            f"   Build number / PDA: {podaci['pda'].get() or '-'}",
+            f"   CSC kod: {podaci['csc'].get() or '-'}",
+            f"   Android verzija: {podaci['android'].get() or '-'}",
+            f"   Serijski broj: {podaci['serijski'].get() or '-'}",
+            f"   Knox warranty bit (prije): {podaci['knox_pocetno'].get()}",
+            f"   Bootloader (prije): {podaci['bootloader_pocetno'].get()}",
+            "",
+            "2. FIRMWARE",
+            f"   AP fajl: {podaci['ap_fajl'].get() or '-'}",
+            f"   Preuzet firmware: {da_ne(podaci['firmware_preuzet'].get())}",
+            "",
+            "3. OPCIJE ZA PROGRAMERE",
+            f"   OEM unlocking (zadnja provjera): {podaci['oem_status'].get()}",
+            f"   Urađeno: {da_ne(podaci['dev_opcije'].get())}",
+            "",
+            "4. OTKLJUČAVANJE BOOTLOADERA",
+            f"   Bootloader (zadnja provjera): {podaci['bootloader_sada'].get()}",
+            f"   Urađeno: {da_ne(podaci['bootloader_otkljucan'].get())}",
+            "",
+            "5. MAGISK PATCH",
+            f"   Patchovan fajl: {podaci['patch_fajl'].get() or '-'}",
+            f"   Urađeno: {da_ne(podaci['magisk_patch'].get())}",
+            "",
+            "6. ODIN FLASH",
+            f"   Urađeno: {da_ne(podaci['odin_flash'].get())}",
+            "",
+            "7. PROVJERA ROOTA",
+            f"   Rezultat: {podaci['root_status'].get()}",
+            "",
+            "Napomena: Knox warranty bit, jednom postavljen na 1, ostaje "
+            "trajan i ne vraća se flešovanjem stock firmware-a.",
+        ]
+        return "\n".join(redovi)
+
+    def osvjezi_rezime():
+        rezime_tekst.config(state="normal")
+        rezime_tekst.delete("1.0", "end")
+        rezime_tekst.insert("1.0", sastavi_rezime())
+        rezime_tekst.config(state="disabled")
+
+    def sacuvaj_rezime():
+        odrediste = folder / "ROOT_LOG"
+        try:
+            odrediste.mkdir(parents=True, exist_ok=True)
+            putanja = odrediste / f"{datetime.now():%Y%m%d_%H%M%S}_root_hodogram.txt"
+            putanja.write_text(sastavi_rezime(), encoding="utf-8")
+        except OSError as e:
+            messagebox.showerror("Greška", str(e), parent=prozor)
+            return
+        zabiljezi(f"ROOT eksport: rezime sačuvan u {putanja}")
+        status.set(f"ROOT hodogram sačuvan: {putanja.name}")
+        if messagebox.askyesno(
+            "Sačuvano", f"Rezime je sačuvan:\n{putanja}\n\nOtvoriti folder?",
+            parent=prozor
+        ):
+            os.startfile(odrediste)
+
+    red_rezime_dugmad = tk.Frame(k8, bg="#FFFFFF")
+    red_rezime_dugmad.pack(fill="x")
+    tk.Button(
+        red_rezime_dugmad, text="Osvježi rezime", command=osvjezi_rezime,
+        bg="#D8E8FA", fg="#174A7E", relief="flat", padx=12, pady=6
+    ).pack(side="left", padx=(0, 6))
+    tk.Button(
+        red_rezime_dugmad, text="Sačuvaj kao TXT", command=sacuvaj_rezime,
+        bg="#2E7D32", fg="white", relief="flat", padx=12, pady=6
+    ).pack(side="left")
+
+    koraci_frame = (k1, k2, k3, k4, k5, k6, k7, k8)
+    indeks = {"trenutni": 0}
+
+    def prikazi_korak(novi_indeks):
+        koraci_frame[indeks["trenutni"]].pack_forget()
+        indeks["trenutni"] = novi_indeks
+        koraci_frame[novi_indeks].pack(fill="both", expand=True)
+        koraci_oznaka.set(
+            f"Korak {novi_indeks + 1} od {len(koraci_frame)}  ·  "
+            f"{ROOT_KORACI[novi_indeks]}"
+        )
+        if novi_indeks == 1:
+            osvjezi_podatke_oznaku()
+        if novi_indeks == len(koraci_frame) - 1:
+            osvjezi_rezime()
+        nazad_dugme.config(state="normal" if novi_indeks > 0 else "disabled")
+        dalje_dugme.config(
+            state="normal" if novi_indeks < len(koraci_frame) - 1 else "disabled"
+        )
+
+    navigacija = tk.Frame(prozor, bg="#EAF2FB")
+    navigacija.pack(fill="x", padx=16, pady=(0, 14))
+    nazad_dugme = tk.Button(
+        navigacija, text="← Nazad",
+        command=lambda: prikazi_korak(indeks["trenutni"] - 1),
+        bg="#D8E8FA", fg="#174A7E", relief="flat", padx=12, pady=7,
+        state="disabled"
+    )
+    nazad_dugme.pack(side="left")
+    tk.Button(
+        navigacija, text="Zatvori", command=prozor.destroy,
+        bg="#D8E8FA", fg="#174A7E", relief="flat", padx=12, pady=7
+    ).pack(side="right")
+    dalje_dugme = tk.Button(
+        navigacija, text="Dalje →",
+        command=lambda: prikazi_korak(indeks["trenutni"] + 1),
+        bg="#1769D2", fg="white", relief="flat", padx=12, pady=7
+    )
+    dalje_dugme.pack(side="right", padx=(0, 6))
+
+    prikazi_korak(0)
+    prozor.bind("<Escape>", lambda _event: prozor.destroy())
+    centriraj_prozor(prozor, app)
+
 def ugasi_adb_server():
     try:
         subprocess.run(
@@ -1640,6 +2569,8 @@ def zatvori_aplikaciju():
     koraci = [zaustavi_automatske_screenshotove]
     if adb_status_job is not None:
         koraci.append(lambda: app.after_cancel(adb_status_job))
+    if info_telefona_job is not None:
+        koraci.append(lambda: app.after_cancel(info_telefona_job))
     koraci.append(lambda: zaustavi_proces(tiho=True))
     if kamera_writer is not None:
         koraci.append(kamera_writer.release)
@@ -1670,6 +2601,7 @@ app.report_callback_exception = prijavi_gresku_callbacka
 status = tk.StringVar(value="Izaberi izvor snimanja")
 broj_slika_status = tk.StringVar(value="Snimljeno slika: 0")
 adb_status = tk.StringVar()
+info_telefona = tk.StringVar(value="Telefon: provjeravam konekciju...")
 adb_verzija_localna = verzija_adb()
 rucni_pomak_aktivan = tk.BooleanVar(value=False)
 rucni_pomak = tk.StringVar(value="85")
@@ -1711,6 +2643,11 @@ sadrzaj.pack(fill="both", expand=True, padx=16, pady=14)
 izbor_rezima = tk.Frame(sadrzaj, bg="#FFFFFF")
 izbor_rezima.pack(fill="both", expand=True)
 tk.Label(
+    izbor_rezima, textvariable=info_telefona, bg="#F4F8FC", fg="#174A7E",
+    font=("Consolas", 9, "bold"), justify="left", anchor="w",
+    padx=10, pady=6, relief="solid", bd=1
+).pack(fill="x", pady=(0, 10))
+tk.Label(
     izbor_rezima,
     text="IZABERI IZVOR SNIMANJA",
     bg="#FFFFFF",
@@ -1733,6 +2670,18 @@ tk.Button(
     izbor_rezima,
     text="IZVLAČENJE PODATAKA IZ TELEFONA  ·  ADB",
     command=lambda: pokreni_ekstrakciju(),
+    height=3
+).pack(fill="x", pady=5)
+tk.Button(
+    izbor_rezima,
+    text="WHATSAPP EKSPORT CHATA",
+    command=whatsapp_eksport,
+    height=3
+).pack(fill="x", pady=5)
+tk.Button(
+    izbor_rezima,
+    text="ROOT EKSPORT  ·  HODOGRAM ROOTOVANJA",
+    command=root_eksport,
     height=3
 ).pack(fill="x", pady=5)
 
@@ -2018,4 +2967,5 @@ app.minsize(506, visina_minimalna)
 pozicioniraj_glavni_prozor_desno()
 zabiljezi("Aplikacija je pokrenuta. Log se čuva samo dok je aplikacija otvorena.")
 osvjezi_adb_status()
+osvjezi_info_telefona()
 app.mainloop()

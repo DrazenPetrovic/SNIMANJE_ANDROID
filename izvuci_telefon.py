@@ -4,6 +4,7 @@ import getpass
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import zipfile
@@ -18,6 +19,24 @@ APP_DIR = (
 ADB_EXE = APP_DIR / "platform-tools" / "adb.exe"
 ADB_SERVER_PORT = 5038
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+SQLITE_ZAGLAVLJE = b"SQLite format 3\x00"
+
+# Sistemski podaci dostupni bez roota preko "content query".
+# Kolona sa slobodnim tekstom je zadnja, jer vrijednost može sadržati ", ".
+SISTEMSKI_IZVORI = {
+    "sms": (
+        "content://sms",
+        ["_id", "thread_id", "address", "date", "date_sent", "type", "read", "body"],
+    ),
+    "pozivi": (
+        "content://call_log/calls",
+        ["_id", "number", "date", "duration", "type", "name"],
+    ),
+    "kontakti": (
+        "content://com.android.contacts/data/phones",
+        ["_id", "contact_id", "data1", "display_name"],
+    ),
+}
 
 log_linije = []
 
@@ -96,6 +115,127 @@ def aplikacije(serial):
     return rezultat
 
 
+def parsiraj_red(tekst, kolone):
+    # Format reda: "_id=1, address=+387..., body=tekst, može, sadržati zareze"
+    red = {}
+    pozicija = len(kolone[0]) + 1
+    if not tekst.startswith(f"{kolone[0]}="):
+        return None
+    for i, kolona in enumerate(kolone):
+        if i + 1 < len(kolone):
+            kraj = tekst.find(f", {kolone[i + 1]}=", pozicija)
+            if kraj < 0:
+                return None
+            red[kolona] = tekst[pozicija:kraj]
+            pozicija = kraj + len(kolone[i + 1]) + 3
+        else:
+            red[kolona] = tekst[pozicija:]
+    return {k: (None if v == "NULL" else v) for k, v in red.items()}
+
+
+def content_query(serial, uri, kolone):
+    rezultat = adb(
+        "shell", "content", "query", "--uri", uri,
+        "--projection", ":".join(kolone),
+        serial=serial, timeout=300,
+    )
+    tekst = rezultat.stdout
+    pocetak = tekst.lstrip()
+    if rezultat.returncode != 0 or not (
+        pocetak.startswith("Row: ") or pocetak.startswith("No result found")
+    ):
+        raise RuntimeError((rezultat.stderr or tekst).strip()[:300] or "content query nije uspio")
+
+    # Vrijednost (npr. tijelo SMS-a) može imati više linija;
+    # novi red uvijek počinje sa "Row: N ".
+    zapisi, trenutni = [], None
+    for linija in tekst.rstrip("\r\n").split("\n"):
+        linija = linija.rstrip("\r")
+        if linija.startswith("Row: "):
+            if trenutni is not None:
+                zapisi.append(trenutni)
+            trenutni = linija.split(" ", 2)[2] if linija.count(" ") >= 2 else ""
+        elif trenutni is not None:
+            trenutni += "\n" + linija
+    if trenutni is not None:
+        zapisi.append(trenutni)
+
+    redovi, neispravni = [], 0
+    for zapis in zapisi:
+        red = parsiraj_red(zapis, kolone)
+        if red is None:
+            neispravni += 1
+        else:
+            redovi.append(red)
+    return redovi, neispravni
+
+
+def izvezi_sistemske_podatke(serial, izlaz_dir):
+    izlaz_dir.mkdir(parents=True, exist_ok=True)
+    baza = sqlite3.connect(izlaz_dir / "podaci.sqlite")
+    try:
+        for ime, (uri, kolone) in SISTEMSKI_IZVORI.items():
+            try:
+                redovi, neispravni = content_query(serial, uri, kolone)
+            except (RuntimeError, subprocess.TimeoutExpired) as greska:
+                log(f"{ime}: nije dostupno ({greska})")
+                continue
+            with open(izlaz_dir / f"{ime}.csv", "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=kolone)
+                w.writeheader()
+                w.writerows(redovi)
+            baza.execute(f'CREATE TABLE "{ime}" ({", ".join(f"{k} TEXT" for k in kolone)})')
+            baza.executemany(
+                f'INSERT INTO "{ime}" VALUES ({", ".join("?" for _ in kolone)})',
+                [[r[k] for k in kolone] for r in redovi],
+            )
+            baza.commit()
+            log(f"{ime}: {len(redovi)} zapisa"
+                + (f", {neispravni} neprepoznatih redova" if neispravni else ""))
+    finally:
+        baza.close()
+
+
+def je_sqlite(putanja):
+    try:
+        with open(putanja, "rb") as f:
+            return f.read(16) == SQLITE_ZAGLAVLJE
+    except OSError:
+        return False
+
+
+def tabele_sqlite(putanja):
+    # immutable=1: baza se samo čita, bez -wal/-journal fajlova i bez izmjena.
+    uri = putanja.resolve().as_uri() + "?mode=ro&immutable=1"
+    veza = sqlite3.connect(uri, uri=True)
+    try:
+        tabele = [r[0] for r in veza.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        return {
+            t: veza.execute(f'SELECT COUNT(*) FROM "{t.replace(chr(34), chr(34) * 2)}"').fetchone()[0]
+            for t in tabele
+        }
+    finally:
+        veza.close()
+
+
+def pronadji_sqlite_baze(korijen):
+    baze, whatsapp_backupi = [], []
+    for putanja in sorted(korijen.rglob("*")):
+        if not putanja.is_file():
+            continue
+        relativna = putanja.relative_to(korijen).as_posix()
+        if putanja.name.startswith("msgstore") and ".crypt" in putanja.name:
+            whatsapp_backupi.append(relativna)
+        if not je_sqlite(putanja):
+            continue
+        try:
+            baze.append({"putanja": relativna, "tabele": tabele_sqlite(putanja)})
+        except sqlite3.Error as greska:
+            baze.append({"putanja": relativna, "greska": str(greska)})
+    return baze, whatsapp_backupi
+
+
 def napravi_manifest(korijen):
     stavke = []
     for putanja in sorted(korijen.rglob("*")):
@@ -121,6 +261,10 @@ def main():
     parser.add_argument("--izvor", default="/sdcard", help="Putanja na telefonu (zadano /sdcard).")
     parser.add_argument("--operater", default=getpass.getuser())
     parser.add_argument("--bez-zip", action="store_true")
+    parser.add_argument(
+        "--bez-sistemskih", action="store_true",
+        help="Ne izvoziti SMS, pozive i kontakte.",
+    )
     args = parser.parse_args()
 
     if not ADB_EXE.exists():
@@ -151,6 +295,10 @@ def main():
         json.dumps(apps, indent=2, ensure_ascii=False), encoding="utf-8")
     log(f"Instalirano korisnickih aplikacija: {len(apps)}")
 
+    if not args.bez_sistemskih:
+        log("Izvoz SMS-a, poziva i kontakata (content query)...")
+        izvezi_sistemske_podatke(serial, paket_dir / "sistemski_podaci")
+
     log(f"Kopiranje {args.izvor} (moze potrajati)...")
     pull = adb("pull", "-a", args.izvor, str(fajlovi_dir), serial=serial)
     for linija in (pull.stdout + pull.stderr).splitlines():
@@ -159,8 +307,21 @@ def main():
     if pull.returncode != 0:
         log("UPOZORENJE: adb pull je zavrsio s greskom, paket moze biti nepotpun.")
 
+    log("Trazenje SQLite baza u kopiranim fajlovima...")
+    baze, whatsapp_backupi = pronadji_sqlite_baze(fajlovi_dir)
+    (paket_dir / "sqlite_baze.json").write_text(
+        json.dumps(baze, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(f"Pronadjeno SQLite baza: {len(baze)}")
+    for baza in baze:
+        opis = baza.get("greska") or ", ".join(
+            f"{t} ({n})" for t, n in baza["tabele"].items()) or "bez tabela"
+        log(f"  {baza['putanja']}: {opis}")
+    for backup in whatsapp_backupi:
+        log(f"WhatsApp backup (sifrovan): {backup}")
+
     log("Racunanje SHA-256 hasheva...")
-    stavke = napravi_manifest(fajlovi_dir)
+    # Manifest pokriva cijeli paket (fajlovi/, sistemski_podaci/, JSON izvjestaji).
+    stavke = napravi_manifest(paket_dir)
     (paket_dir / "manifest.json").write_text(
         json.dumps(stavke, indent=2, ensure_ascii=False), encoding="utf-8")
     with open(paket_dir / "manifest.csv", "w", newline="", encoding="utf-8-sig") as f:
