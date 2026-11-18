@@ -5,7 +5,9 @@ from tkinter import ttk
 from pathlib import Path
 from datetime import datetime
 import base64
+import csv
 import ctypes
+import json
 from ctypes import wintypes
 import hashlib
 import re
@@ -25,6 +27,10 @@ APP_DIR = (
 ADB_EXE = APP_DIR / "platform-tools" / "adb.exe"
 SCRCPY_EXE = APP_DIR / "scrcpy" / "scrcpy.exe"
 ADB_SERVER_PORT = 5038
+OXYGEN_ADB_EXE = Path(
+    r"C:\Program Files\Oxygen Forensics\Oxygen Forensic Detective"
+    r"\DeviceExtractor\adb\adb.exe"
+)
 # U --windowed exe verziji svaki konzolni program bi otvorio crni prozor.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # Folderi na telefonu u kojima završe exporti chatova: WhatsApp dokumenti
@@ -194,7 +200,8 @@ def verzija_adb():
             capture_output=True,
             stdin=subprocess.DEVNULL,
             text=True,
-            timeout=5
+            timeout=5,
+            creationflags=NO_WINDOW
         )
     except (OSError, subprocess.TimeoutExpired):
         return "nije dostupna"
@@ -275,6 +282,89 @@ def ugasi_adb_server():
         zabiljezi(f"ADB server na portu {ADB_SERVER_PORT} nije ugašen.")
     else:
         zabiljezi(f"ADB server na portu {ADB_SERVER_PORT} je ugašen.")
+
+def resetuj_adb_za_oxygen():
+    if snimanje or automatski_screenshot_aktivan or arhiva_aktivna:
+        messagebox.showwarning(
+            "Reset ADB",
+            "Prvo zaustavi snimanje / screenshotove u aplikaciji.",
+            parent=app
+        )
+        return
+    if not messagebox.askyesno(
+        "Reset ADB servera",
+        "Koristi ovo SAMO kada NIJE aktivna forenzička akvizicija.\n\n"
+        "Prvo zatvori Oxygen Forensic Detective / Device Extractor.\n"
+        "Aplikacija će zatvoriti scrcpy i zaustaviti ADB servere "
+        "(port 5038 i Oxygenov 5037).\n\nNastaviti?",
+        parent=app
+    ):
+        return
+
+    def ps(komanda):
+        return subprocess.run(
+            ["powershell", "-NoProfile", "-Command", komanda],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL, creationflags=NO_WINDOW
+        ).stdout.strip()
+
+    def adb_komanda(exe, port, *args):
+        if not Path(exe).is_file():
+            return f"(nije pronađen: {exe})"
+        r = subprocess.run(
+            [str(exe), "-P", str(port), *args],
+            capture_output=True, text=True, timeout=20,
+            stdin=subprocess.DEVNULL, creationflags=NO_WINDOW
+        )
+        return (r.stdout + r.stderr).strip() or "OK"
+
+    def radi():
+        izvjestaj = []
+        try:
+            zaustavi_proces(tiho=True)
+            izvjestaj.append("1. scrcpy zatvoren.")
+            izvjestaj.append(
+                "2. ADB server aplikacije (5038): "
+                + adb_komanda(ADB_EXE, ADB_SERVER_PORT, "kill-server")
+            )
+            izvjestaj.append(
+                "3. Oxygen ADB server (5037): "
+                + adb_komanda(OXYGEN_ADB_EXE, 5037, "kill-server")
+            )
+            izvjestaj.append(
+                "\n5. Oxygen ADB devices:\n"
+                + adb_komanda(OXYGEN_ADB_EXE, 5037, "devices", "-l")
+            )
+            izvjestaj.append(
+                "\n6. Aktivni adb.exe procesi:\n"
+                + (ps(
+                    "Get-CimInstance Win32_Process -Filter \"name = 'adb.exe'\" "
+                    "| Select-Object ProcessId, ParentProcessId, ExecutablePath "
+                    "| Format-List | Out-String"
+                ) or "nema")
+            )
+            for port in (5037, 5038):
+                izvjestaj.append(
+                    f"\n{'7' if port == 5037 else '8'}. Port {port}:\n"
+                    + (ps(
+                        f"Get-NetTCPConnection -LocalPort {port} "
+                        "-ErrorAction SilentlyContinue "
+                        "| Select-Object LocalAddress, LocalPort, State, "
+                        "OwningProcess | Format-Table | Out-String"
+                    ) or "slobodan")
+                )
+            izvjestaj.append(
+                "\n4. Sada ponovo pokreni Oxygen i Device Extractor "
+                "i poveži/otključaj telefon."
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            izvjestaj.append(f"Greška: {e}")
+        tekst = "\n".join(izvjestaj)
+        zabiljezi("Reset ADB za Oxygen:\n" + tekst)
+        app.after(0, lambda: messagebox.showinfo(
+            "Reset ADB - rezultat", tekst, parent=app))
+
+    threading.Thread(target=radi, daemon=True).start()
 
 def centriraj_prozor(prozor, roditelj=None):
     prozor.update_idletasks()
@@ -547,7 +637,7 @@ def pokreni_scrcpy(komanda, pokrenuto_snimanje=False, putanja=None):
             komanda,
             cwd=SCRCPY_EXE.parent,
             env=okruzenje,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | NO_WINDOW
         )
     except OSError as e:
         proces = None
@@ -585,7 +675,8 @@ def proveri_telefon():
             capture_output=True,
             stdin=subprocess.DEVNULL,
             text=True,
-            timeout=10
+            timeout=10,
+            creationflags=NO_WINDOW
         )
     except FileNotFoundError:
         status.set("ADB nije pronađen")
@@ -829,7 +920,9 @@ def screenshot(automatski=False):
                 ],
                 stdout=fajl,
                 stderr=subprocess.PIPE,
-                timeout=20
+                stdin=subprocess.DEVNULL,
+                timeout=20,
+                creationflags=NO_WINDOW
             )
         if rezultat.returncode != 0:
             putanja.unlink(missing_ok=True)
@@ -854,7 +947,9 @@ def adb_poziv(argumenti, timeout=20):
         rezultat = subprocess.run(
             [str(ADB_EXE), "-P", str(ADB_SERVER_PORT), *argumenti],
             capture_output=True,
-            timeout=timeout
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            creationflags=NO_WINDOW
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError(f"ADB naredba nije uspjela: {e}") from e
@@ -1987,6 +2082,551 @@ def whatsapp_eksport():
     prozor.bind("<Escape>", lambda _event: prozor.destroy())
     centriraj_prozor(prozor, app)
 
+PREGLED_MEDIJI = {".png", ".jpg", ".jpeg", ".mp4", ".mkv", ".avi", ".mov"}
+PREGLED_LIMIT_REDOVA = 20000
+TIPOVI_SMS = {
+    "1": "primljena", "2": "poslana", "3": "nacrt",
+    "4": "izlazni", "5": "neuspjela", "6": "red čekanja",
+}
+TIPOVI_POZIVA = {
+    "1": "dolazni", "2": "odlazni", "3": "propušten",
+    "4": "govorna pošta", "5": "odbijen", "6": "blokiran",
+}
+
+def datum_iz_ms(vrijednost):
+    try:
+        if int(vrijednost) <= 0:
+            return vrijednost
+        return datetime.fromtimestamp(int(vrijednost) / 1000).strftime(
+            "%d.%m.%Y %H:%M:%S"
+        )
+    except (ValueError, OSError, OverflowError):
+        return vrijednost
+
+def ucitaj_csv_pregled(putanja, tipovi=None):
+    with open(putanja, newline="", encoding="utf-8-sig") as fajl:
+        citac = csv.DictReader(fajl)
+        kolone = list(citac.fieldnames or [])
+        redovi = []
+        for zapis in citac:
+            red = []
+            for k in kolone:
+                v = zapis.get(k) or ""
+                if k in ("date", "date_sent"):
+                    v = datum_iz_ms(v)
+                elif k == "type" and tipovi:
+                    v = tipovi.get(v, v)
+                red.append(v)
+            redovi.append(red)
+    return kolone, redovi
+
+def ucitaj_csv_sirovo(putanja):
+    with open(putanja, newline="", encoding="utf-8-sig") as fajl:
+        sve = list(csv.reader(fajl))
+    return (sve[0], sve[1:]) if sve else ([], [])
+
+def json_u_tabelu(podaci):
+    def tekst(v):
+        if isinstance(v, dict):
+            return ", ".join(f"{k} ({tekst(x)})" for k, x in v.items())
+        if isinstance(v, list):
+            return ", ".join(tekst(x) for x in v)
+        return "" if v is None else str(v)
+    if isinstance(podaci, dict):
+        return ["Svojstvo", "Vrijednost"], [[k, tekst(v)] for k, v in podaci.items()]
+    if podaci and all(isinstance(x, dict) for x in podaci):
+        kolone = []
+        for x in podaci:
+            kolone += [k for k in x if k not in kolone]
+        return kolone, [[tekst(x.get(k)) for k in kolone] for x in podaci]
+    return ["Vrijednost"], [[tekst(x)] for x in podaci]
+
+def ucitaj_json_pregled(putanja):
+    return json_u_tabelu(json.loads(putanja.read_text(encoding="utf-8")))
+
+def ucitaj_log_pregled(putanja):
+    linije = putanja.read_text(encoding="utf-8", errors="replace").splitlines()
+    return ["Zapis"], [[l] for l in linije]
+
+PREGLED_EKSTRAKCIJE = {
+    "SMS poruke": lambda p: ucitaj_csv_pregled(
+        p / "sistemski_podaci" / "sms.csv", TIPOVI_SMS),
+    "Pozivi": lambda p: ucitaj_csv_pregled(
+        p / "sistemski_podaci" / "pozivi.csv", TIPOVI_POZIVA),
+    "Kontakti": lambda p: ucitaj_csv_pregled(
+        p / "sistemski_podaci" / "kontakti.csv"),
+    "Aplikacije": lambda p: ucitaj_json_pregled(p / "aplikacije.json"),
+    "Podaci o uređaju": lambda p: ucitaj_json_pregled(p / "info_uredjaja.json"),
+    "SQLite baze": lambda p: ucitaj_json_pregled(p / "sqlite_baze.json"),
+    "Spisak fajlova (manifest)": lambda p: ucitaj_csv_sirovo(p / "manifest.csv"),
+    "Log izvlačenja": lambda p: ucitaj_log_pregled(p / "log_izvlacenja.txt"),
+}
+
+def pregled_podataka():
+    prozor = tk.Toplevel(app)
+    prozor.title("Pregled snimljenih podataka")
+    prozor.configure(bg="#EAF2FB")
+    prozor.geometry("1000x640")
+    prozor.minsize(760, 480)
+
+    tk.Label(
+        prozor, text="Pregled snimljenih podataka", bg="#EAF2FB",
+        fg="#174A7E", font=("Segoe UI", 11, "bold")
+    ).pack(anchor="w", padx=14, pady=(10, 2))
+    tk.Label(
+        prozor, text=f"Glavni folder: {folder}", bg="#EAF2FB", fg="#51677F",
+        font=("Segoe UI", 9)
+    ).pack(anchor="w", padx=14, pady=(0, 6))
+
+    kartice = ttk.Notebook(prozor)
+    kartice.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+    def otvori(putanja):
+        if Path(putanja).exists():
+            os.startfile(putanja)
+        else:
+            messagebox.showinfo(
+                "Nema podataka", f"Folder još ne postoji:\n{putanja}", parent=prozor
+            )
+
+    def sortiraj(tabela, kolona, obrnuto):
+        stavke = [(tabela.set(i, kolona), i) for i in tabela.get_children("")]
+        def kljuc(s):
+            try:
+                return (0, float(s[0]), "")
+            except ValueError:
+                return (1, 0, s[0].lower())
+        stavke.sort(key=kljuc, reverse=obrnuto)
+        for n, (_, i) in enumerate(stavke):
+            tabela.move(i, "", n)
+        tabela.heading(kolona, command=lambda: sortiraj(tabela, kolona, not obrnuto))
+
+    def napravi_tabelu(roditelj):
+        okvir = tk.Frame(roditelj)
+        tabela = ttk.Treeview(okvir, show="headings", selectmode="browse")
+        vert = ttk.Scrollbar(okvir, orient="vertical", command=tabela.yview)
+        hor = ttk.Scrollbar(okvir, orient="horizontal", command=tabela.xview)
+        tabela.configure(yscrollcommand=vert.set, xscrollcommand=hor.set)
+        tabela.grid(row=0, column=0, sticky="nsew")
+        vert.grid(row=0, column=1, sticky="ns")
+        hor.grid(row=1, column=0, sticky="ew")
+        okvir.rowconfigure(0, weight=1)
+        okvir.columnconfigure(0, weight=1)
+        return okvir, tabela
+
+    def popuni(tabela, kolone, redovi, filtar=""):
+        tabela.delete(*tabela.get_children())
+        tabela["columns"] = kolone
+        filtar = filtar.strip().lower()
+        prikazani = []
+        for red in redovi:
+            if filtar and filtar not in " ".join(red).lower():
+                continue
+            prikazani.append([str(v).replace("\r", " ").replace("\n", " ") for v in red])
+            if len(prikazani) >= PREGLED_LIMIT_REDOVA:
+                break
+        for n, k in enumerate(kolone):
+            najduze = max((len(r[n]) for r in prikazani[:200] if n < len(r)), default=0)
+            tabela.heading(k, text=k, command=lambda k=k: sortiraj(tabela, k, False))
+            tabela.column(k, width=min(520, max(70, len(k) * 10, najduze * 7)),
+                          stretch=False)
+        for red in prikazani:
+            tabela.insert("", "end", values=red)
+        return len(prikazani)
+
+    # ---------- 1. kartica: slike i video ----------
+    k_mediji = tk.Frame(kartice, bg="#FFFFFF")
+    kartice.add(k_mediji, text="  Slike i video  ")
+    traka = tk.Frame(k_mediji, bg="#FFFFFF")
+    traka.pack(fill="x", padx=8, pady=6)
+    medij_info = tk.StringVar()
+    tk.Label(traka, textvariable=medij_info, bg="#FFFFFF", fg="#51677F").pack(side="left")
+    tk.Button(traka, text="Otvori folder", command=lambda: otvori(folder)).pack(side="right")
+    tk.Button(traka, text="Osvježi", command=lambda: osvjezi_medije()).pack(
+        side="right", padx=6)
+    podjela = tk.PanedWindow(k_mediji, orient="horizontal", sashwidth=5)
+    podjela.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    okvir_medija, tabela_medija = napravi_tabelu(podjela)
+    podjela.add(okvir_medija, width=480)
+    slika_oznaka = tk.Label(
+        podjela, text="Izaberi sliku za pregled.\nDvoklik otvara fajl u zadanom programu.",
+        bg="#F4F8FC", fg="#51677F", justify="center"
+    )
+    podjela.add(slika_oznaka)
+    slika_ref = {}
+
+    def osvjezi_medije():
+        fajlovi = []
+        if folder.is_dir():
+            fajlovi = [p for p in folder.iterdir()
+                       if p.is_file() and p.suffix.lower() in PREGLED_MEDIJI]
+        fajlovi.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        redovi = [[
+            p.name, f"{p.stat().st_size / 1024:,.0f} KB",
+            datetime.fromtimestamp(p.stat().st_mtime).strftime("%d.%m.%Y %H:%M:%S"),
+        ] for p in fajlovi]
+        popuni(tabela_medija, ["Naziv", "Veličina", "Datum"], redovi)
+        tabela_medija.column("Naziv", width=240)
+        medij_info.set(f"{len(fajlovi)} fajlova u {folder.name}")
+
+    def izabrana_slika(_event=None):
+        izbor = tabela_medija.selection()
+        if not izbor:
+            return
+        putanja = folder / tabela_medija.set(izbor[0], "Naziv")
+        slika_ref.clear()
+        if putanja.suffix.lower() != ".png":
+            slika_oznaka.configure(
+                image="", text=f"{putanja.name}\n\nPregled je dostupan samo za PNG.\n"
+                               "Dvoklik otvara fajl.")
+            return
+        try:
+            slika = tk.PhotoImage(file=str(putanja))
+            faktor = max(1, -(-slika.width() // 480), -(-slika.height() // 520))
+            if faktor > 1:
+                slika = slika.subsample(faktor)
+            slika_ref["slika"] = slika
+            slika_oznaka.configure(image=slika, text="")
+        except tk.TclError as e:
+            slika_oznaka.configure(image="", text=f"Slika se ne može prikazati:\n{e}")
+
+    tabela_medija.bind("<<TreeviewSelect>>", izabrana_slika)
+    tabela_medija.bind(
+        "<Double-1>",
+        lambda _e: tabela_medija.selection() and otvori(
+            folder / tabela_medija.set(tabela_medija.selection()[0], "Naziv")),
+    )
+
+    # ---------- 2. kartica: ekstrakcije (ADB) ----------
+    k_ekstr = tk.Frame(kartice, bg="#FFFFFF")
+    kartice.add(k_ekstr, text="  Izvučeni podaci (ADB)  ")
+    ekstr_izvor = {"baza": None, "samo": None}
+    baza_ekstr = lambda: ekstr_izvor["baza"] or folder / "EKSTRAKCIJE"
+    traka = tk.Frame(k_ekstr, bg="#FFFFFF")
+    traka.pack(fill="x", padx=8, pady=6)
+    paket_var = tk.StringVar()
+    pogled_var = tk.StringVar(value="SMS poruke")
+    filtar_ekstr = tk.StringVar()
+    tk.Label(traka, text="Ekstrakcija:", bg="#FFFFFF").pack(side="left")
+    paket_combo = ttk.Combobox(traka, textvariable=paket_var, state="readonly", width=42)
+    paket_combo.pack(side="left", padx=(4, 10))
+    tk.Label(traka, text="Prikaz:", bg="#FFFFFF").pack(side="left")
+    pogled_combo = ttk.Combobox(
+        traka, textvariable=pogled_var, state="readonly", width=24,
+        values=list(PREGLED_EKSTRAKCIJE))
+    pogled_combo.pack(side="left", padx=4)
+    tk.Button(traka, text="Otvori folder",
+              command=lambda: otvori(baza_ekstr())).pack(side="right")
+    tk.Button(traka, text="Osvježi", command=lambda: osvjezi_pakete()).pack(
+        side="right", padx=6)
+    tk.Button(traka, text="Izaberi drugi folder...",
+              command=lambda: izaberi_ekstr_folder()).pack(side="right")
+    traka2 = tk.Frame(k_ekstr, bg="#FFFFFF")
+    traka2.pack(fill="x", padx=8, pady=(0, 6))
+    tk.Label(traka2, text="Traži:", bg="#FFFFFF").pack(side="left")
+    tk.Entry(traka2, textvariable=filtar_ekstr, width=40).pack(side="left", padx=4)
+    ekstr_info = tk.StringVar()
+    tk.Label(traka2, textvariable=ekstr_info, bg="#FFFFFF", fg="#51677F").pack(
+        side="left", padx=10)
+    okvir_ekstr, tabela_ekstr = napravi_tabelu(k_ekstr)
+    okvir_ekstr.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    ekstr_podaci = {"kolone": [], "redovi": []}
+
+    def primijeni_filtar_ekstr(*_):
+        n = popuni(tabela_ekstr, ekstr_podaci["kolone"], ekstr_podaci["redovi"],
+                   filtar_ekstr.get())
+        ekstr_info.set(f"Prikazano {n} od {len(ekstr_podaci['redovi'])} zapisa")
+
+    def ucitaj_ekstrakciju(*_):
+        ime = paket_var.get()
+        if not ime:
+            ekstr_podaci.update(kolone=["Poruka"], redovi=[[
+                "Nema ekstrakcija. Koristi dugme IZVLAČENJE PODATAKA IZ TELEFONA · ADB."
+            ]])
+        else:
+            try:
+                kolone, redovi = PREGLED_EKSTRAKCIJE[pogled_var.get()](baza_ekstr() / ime)
+            except (OSError, ValueError, KeyError) as e:
+                kolone, redovi = ["Poruka"], [[f"Nije dostupno u ovoj ekstrakciji: {e}"]]
+            ekstr_podaci.update(kolone=kolone, redovi=redovi)
+        primijeni_filtar_ekstr()
+
+    def je_paket(putanja):
+        return (putanja / "info_uredjaja.json").is_file() or (
+            putanja / "sistemski_podaci").is_dir()
+
+    def izaberi_ekstr_folder():
+        izabrano = filedialog.askdirectory(
+            initialdir=baza_ekstr() if baza_ekstr().is_dir() else folder,
+            title="Izaberi folder sa ekstrakcijama (ili jednu ekstrakciju)",
+            parent=prozor)
+        if not izabrano:
+            return
+        izabrano = Path(izabrano)
+        if je_paket(izabrano):
+            ekstr_izvor.update(baza=izabrano.parent, samo=izabrano.name)
+        else:
+            ekstr_izvor.update(baza=izabrano, samo=None)
+        osvjezi_pakete()
+
+    def osvjezi_pakete():
+        baza = baza_ekstr()
+        if ekstr_izvor["samo"]:
+            imena = [ekstr_izvor["samo"]]
+        elif baza.is_dir():
+            imena = sorted(
+                (p.name for p in baza.iterdir() if p.is_dir() and je_paket(p)),
+                reverse=True)
+        else:
+            imena = []
+        paket_combo["values"] = imena
+        if paket_var.get() not in imena:
+            paket_var.set(imena[0] if imena else "")
+        ucitaj_ekstrakciju()
+        osvjezi_fajlove()
+
+    paket_combo.bind("<<ComboboxSelected>>", lambda _e: osvjezi_fajlove(), add="+")
+    paket_combo.bind("<<ComboboxSelected>>", ucitaj_ekstrakciju, add="+")
+    pogled_combo.bind("<<ComboboxSelected>>", ucitaj_ekstrakciju)
+    filtar_ekstr.trace_add("write", primijeni_filtar_ekstr)
+
+    # ---------- 3. kartica: WhatsApp exporti ----------
+    k_wa = tk.Frame(kartice, bg="#FFFFFF")
+    kartice.add(k_wa, text="  WhatsApp chatovi  ")
+    wa_dir = lambda: folder / "WHATSAPP_EXPORT"
+    traka = tk.Frame(k_wa, bg="#FFFFFF")
+    traka.pack(fill="x", padx=8, pady=6)
+    filtar_wa = tk.StringVar()
+    wa_info = tk.StringVar()
+    tk.Label(traka, text="Traži u chatu:", bg="#FFFFFF").pack(side="left")
+    tk.Entry(traka, textvariable=filtar_wa, width=36).pack(side="left", padx=4)
+    tk.Label(traka, textvariable=wa_info, bg="#FFFFFF", fg="#51677F").pack(
+        side="left", padx=10)
+    tk.Button(traka, text="Otvori folder", command=lambda: otvori(wa_dir())).pack(
+        side="right")
+    tk.Button(traka, text="Osvježi", command=lambda: osvjezi_wa()).pack(
+        side="right", padx=6)
+    podjela_wa = tk.PanedWindow(k_wa, orient="horizontal", sashwidth=5)
+    podjela_wa.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    lista_wa = tk.Listbox(podjela_wa, exportselection=False, width=38)
+    podjela_wa.add(lista_wa)
+    okvir_teksta = tk.Frame(podjela_wa)
+    tekst_wa = tk.Text(okvir_teksta, wrap="word", font=("Consolas", 10))
+    skrol_wa = ttk.Scrollbar(okvir_teksta, command=tekst_wa.yview)
+    tekst_wa.configure(yscrollcommand=skrol_wa.set, state="disabled")
+    skrol_wa.pack(side="right", fill="y")
+    tekst_wa.pack(side="left", fill="both", expand=True)
+    podjela_wa.add(okvir_teksta, width=620)
+    wa_fajlovi = []
+    wa_sadrzaj = {"linije": []}
+
+    def prikazi_wa(*_):
+        filtar = filtar_wa.get().strip().lower()
+        linije = wa_sadrzaj["linije"]
+        if filtar:
+            linije = [l for l in linije if filtar in l.lower()]
+        tekst_wa.configure(state="normal")
+        tekst_wa.delete("1.0", "end")
+        tekst_wa.insert("1.0", "\n".join(linije))
+        tekst_wa.configure(state="disabled")
+        wa_info.set(f"Prikazano {len(linije)} od {len(wa_sadrzaj['linije'])} linija")
+
+    def izabran_wa(_event=None):
+        izbor = lista_wa.curselection()
+        if not izbor:
+            return
+        putanja = wa_fajlovi[izbor[0]]
+        try:
+            if putanja.suffix.lower() == ".zip":
+                with zipfile.ZipFile(putanja) as arhiva:
+                    imena = arhiva.namelist()
+                    chat = next((n for n in imena if n.lower().endswith(".txt")), None)
+                    if chat is None:
+                        raise ValueError("Zip ne sadrži tekst chata.")
+                    sirovo = arhiva.read(chat)
+                    medija = len(imena) - 1
+                zaglavlje = [f"[Zip: {medija} priloga (slike/glasovne...) — "
+                             "dvoklik na fajl u listi otvara arhivu]", ""]
+            else:
+                sirovo = putanja.read_bytes()
+                zaglavlje = []
+            linije = zaglavlje + sirovo.decode("utf-8", errors="replace").splitlines()
+        except (OSError, ValueError, zipfile.BadZipFile) as e:
+            linije = [f"Ne mogu pročitati chat: {e}"]
+        wa_sadrzaj["linije"] = linije
+        prikazi_wa()
+
+    def osvjezi_wa():
+        wa_fajlovi.clear()
+        lista_wa.delete(0, "end")
+        if wa_dir().is_dir():
+            wa_fajlovi.extend(sorted(
+                (p for p in wa_dir().iterdir()
+                 if p.is_file() and not p.name.startswith(".")
+                 and p.suffix.lower() in (".zip", ".txt")),
+                key=lambda p: p.stat().st_mtime, reverse=True))
+        for p in wa_fajlovi:
+            lista_wa.insert("end", p.name)
+        wa_sadrzaj["linije"] = [] if wa_fajlovi else [
+            "Nema exportovanih chatova. Koristi dugme WHATSAPP EKSPORT CHATA."]
+        prikazi_wa()
+
+    lista_wa.bind("<<ListboxSelect>>", izabran_wa)
+    lista_wa.bind(
+        "<Double-1>",
+        lambda _e: lista_wa.curselection() and otvori(wa_fajlovi[lista_wa.curselection()[0]]),
+    )
+    filtar_wa.trace_add("write", prikazi_wa)
+
+    # ---------- 4. kartica: fajlovi i folderi iz telefona ----------
+    k_fajl = tk.Frame(kartice, bg="#FFFFFF")
+    kartice.add(k_fajl, text="  Folderi iz telefona  ")
+    traka = tk.Frame(k_fajl, bg="#FFFFFF")
+    traka.pack(fill="x", padx=8, pady=6)
+    filtar_fajl = tk.StringVar()
+    fajl_info = tk.StringVar()
+    tk.Label(traka, text="Traži fajl (Enter):", bg="#FFFFFF").pack(side="left")
+    unos_fajl = tk.Entry(traka, textvariable=filtar_fajl, width=30)
+    unos_fajl.pack(side="left", padx=4)
+    tk.Label(traka, textvariable=fajl_info, bg="#FFFFFF", fg="#51677F").pack(
+        side="left", padx=10)
+    tk.Button(traka, text="Otvori izabrani folder",
+              command=lambda: otvori_izabrani()).pack(side="right")
+    tk.Label(
+        k_fajl,
+        text="Dvoklik na folder ga otvara/zatvara, dvoklik na fajl ga otvara "
+             "u zadanom programu. Ekstrakcija se bira u kartici „Izvučeni podaci”.",
+        bg="#FFFFFF", fg="#51677F", anchor="w"
+    ).pack(fill="x", padx=8)
+    okvir_fajl = tk.Frame(k_fajl)
+    okvir_fajl.pack(fill="both", expand=True, padx=8, pady=8)
+    stablo = ttk.Treeview(okvir_fajl, columns=("velicina", "datum"), selectmode="browse")
+    stablo.heading("#0", text="Naziv")
+    stablo.heading("velicina", text="Veličina")
+    stablo.heading("datum", text="Izmijenjen")
+    stablo.column("#0", width=520)
+    stablo.column("velicina", width=100, anchor="e", stretch=False)
+    stablo.column("datum", width=140, stretch=False)
+    vert_f = ttk.Scrollbar(okvir_fajl, orient="vertical", command=stablo.yview)
+    stablo.configure(yscrollcommand=vert_f.set)
+    stablo.pack(side="left", fill="both", expand=True)
+    vert_f.pack(side="right", fill="y")
+
+    def fajl_korijen():
+        ime = paket_var.get()
+        return baza_ekstr() / ime / "fajlovi" if ime else None
+
+    def velicina_tekst(bajtova):
+        for jedinica in ("B", "KB", "MB", "GB"):
+            if bajtova < 1024 or jedinica == "GB":
+                return f"{bajtova:,.0f} {jedinica}" if jedinica == "B" else (
+                    f"{bajtova:,.1f} {jedinica}")
+            bajtova /= 1024
+
+    def red_stavke(p):
+        try:
+            st = p.stat()
+        except OSError:
+            return "", ""
+        datum = datetime.fromtimestamp(st.st_mtime).strftime("%d.%m.%Y %H:%M")
+        return ("" if p.is_dir() else velicina_tekst(st.st_size)), datum
+
+    def dodaj_stavku(roditelj, p, tekst=None):
+        velicina, datum = red_stavke(p)
+        if p.is_dir():
+            stablo.insert(roditelj, "end", iid=str(p), text=tekst or p.name,
+                          values=("", datum))
+            stablo.insert(str(p), "end", iid="dummy:" + str(p))
+        else:
+            stablo.insert(roditelj, "end", iid=str(p), text=tekst or p.name,
+                          values=(velicina, datum))
+
+    def ucitaj_djecu(iid):
+        djeca = stablo.get_children(iid)
+        if len(djeca) != 1 or not djeca[0].startswith("dummy:"):
+            return
+        stablo.delete(djeca[0])
+        try:
+            stavke = sorted(Path(iid).iterdir(),
+                            key=lambda p: (not p.is_dir(), p.name.lower()))
+        except OSError:
+            return
+        for p in stavke:
+            dodaj_stavku(iid, p)
+
+    def otvaranje_cvora(_event=None):
+        iid = stablo.focus()
+        if iid:
+            ucitaj_djecu(iid)
+
+    def otvori_lanac(iid, dubina=0):
+        # Automatski otvara lance sa jednim folderom (npr. fajlovi → sdcard).
+        ucitaj_djecu(iid)
+        stablo.item(iid, open=True)
+        djeca = stablo.get_children(iid)
+        if dubina < 3 and len(djeca) == 1 and Path(djeca[0]).is_dir():
+            otvori_lanac(djeca[0], dubina + 1)
+
+    def osvjezi_fajlove(*_):
+        stablo.delete(*stablo.get_children())
+        korijen = fajl_korijen()
+        if not korijen or not korijen.is_dir():
+            fajl_info.set("Izabrana ekstrakcija nema folder „fajlovi”.")
+            return
+        for p in sorted(korijen.iterdir(),
+                        key=lambda p: (not p.is_dir(), p.name.lower())):
+            dodaj_stavku("", p)
+        djeca = stablo.get_children("")
+        if len(djeca) == 1 and Path(djeca[0]).is_dir():
+            otvori_lanac(djeca[0])
+        fajl_info.set(str(korijen))
+
+    def trazi_fajlove(_event=None):
+        korijen = fajl_korijen()
+        upit = filtar_fajl.get().strip().lower()
+        if not upit:
+            osvjezi_fajlove()
+            return
+        if not korijen or not korijen.is_dir():
+            return
+        stablo.delete(*stablo.get_children())
+        nadjeno = 0
+        for p in korijen.rglob("*"):
+            if upit in p.name.lower():
+                relativno = p.relative_to(korijen).as_posix()
+                velicina, datum = red_stavke(p)
+                stablo.insert("", "end", iid=str(p), text=relativno,
+                              values=("" if p.is_dir() else velicina, datum))
+                nadjeno += 1
+                if nadjeno >= 5000:
+                    break
+        fajl_info.set(f"Pronađeno {nadjeno} stavki"
+                      + (" (prikazano prvih 5000)" if nadjeno >= 5000 else ""))
+
+    def otvori_izabrani():
+        # Izabrani folder; za fajl njegov folder; bez izbora korijen ekstrakcije.
+        izbor = stablo.selection()
+        cilj = None
+        if izbor and not izbor[0].startswith("dummy:"):
+            p = Path(izbor[0])
+            cilj = p if p.is_dir() else p.parent
+        otvori(cilj or fajl_korijen() or baza_ekstr())
+
+    def dvoklik_fajl(_event=None):
+        iid = stablo.focus()
+        if iid and not iid.startswith("dummy:") and Path(iid).is_file():
+            otvori(iid)
+
+    stablo.bind("<<TreeviewOpen>>", otvaranje_cvora)
+    stablo.bind("<Double-1>", dvoklik_fajl)
+    unos_fajl.bind("<Return>", trazi_fajlove)
+
+    osvjezi_medije()
+    osvjezi_pakete()
+    osvjezi_wa()
+    prozor.bind("<Escape>", lambda _event: prozor.destroy())
+    centriraj_prozor(prozor, app)
+
 ROOT_KORACI = (
     "Identifikacija telefona",
     "Firmware",
@@ -2680,8 +3320,14 @@ tk.Button(
 ).pack(fill="x", pady=5)
 tk.Button(
     izbor_rezima,
-    text="ROOT EKSPORT  ·  HODOGRAM ROOTOVANJA",
-    command=root_eksport,
+    text="PREGLEDAJ DO SADA SNIMLJENE PODATKE",
+    command=pregled_podataka,
+    height=3
+).pack(fill="x", pady=5)
+tk.Button(
+    izbor_rezima,
+    text="RESET ADB SERVERA ZA OXYGEN",
+    command=resetuj_adb_za_oxygen,
     height=3
 ).pack(fill="x", pady=5)
 
